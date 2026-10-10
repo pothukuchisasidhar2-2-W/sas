@@ -1,0 +1,11 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# App-internal metadata
+.freebuff/
+
+# SQLite sidecar files (WAL/SHM) — attendance.db itself is tracked today,
+# but the transient journal files never belong in git.
+*.db-wal
+*.db-shm
