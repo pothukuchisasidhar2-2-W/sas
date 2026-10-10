@@ -206,6 +206,17 @@ while True:
             .tobytes()
         )
 
+        # Normalize embedding in place before storing it as bytes.
+        # SFace cosine matching on the server works best with unit-length
+        # vectors, and the same normalization is applied at recognition
+        # time in liv_recog.py. If we ever change the extraction pipeline
+        # later, keep this normalized form as the source of truth.
+        embedding = embedding.astype(np.float32)
+        norm = float(np.linalg.norm(embedding, ord=2))
+        if norm > 0:
+            embedding = embedding / norm
+        embedding_bytes = embedding.tobytes()
+
         connection = sqlite3.connect(
             DB_PATH
         )
@@ -234,7 +245,7 @@ while True:
         print("==============================")
         print("Student ID :", student_id)
         print("Name       :", name)
-        print("Embedding  : Stored")
+        print("Embedding  : Stored (unit-normalized)")
         print("==============================")
 
         # Small delay so user can see success
