@@ -2,10 +2,12 @@ import cv2
 import sqlite3
 import numpy as np
 import time
+from pathlib import Path
 
-YUNET_MODEL = "models/face_detection_yunet_2026may.onnx"
-SFACE_MODEL = "models/face_recognition_sface_2021dec.onnx"
-DB_PATH = "attendance.db"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+YUNET_MODEL = str(PROJECT_ROOT / "models" / "face_detection_yunet_2026may.onnx")
+SFACE_MODEL = str(PROJECT_ROOT / "models" / "face_recognition_sface_2021dec.onnx")
+DB_PATH = str(PROJECT_ROOT / "attendance.db")
 
 # -----------------------------
 # Student details
