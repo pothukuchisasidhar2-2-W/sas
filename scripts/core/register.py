@@ -1,6 +1,7 @@
 import cv2
 import sqlite3
 import numpy as np
+import sys
 import time
 from pathlib import Path
 
@@ -8,6 +9,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 YUNET_MODEL = str(PROJECT_ROOT / "models" / "face_detection_yunet_2026may.onnx")
 SFACE_MODEL = str(PROJECT_ROOT / "models" / "face_recognition_sface_2021dec.onnx")
 DB_PATH = str(PROJECT_ROOT / "attendance.db")
+
+# Sibling module (scripts/core/ref_store.py): used here to clear stale
+# harvested references when a student re-registers.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ref_store
 
 # -----------------------------
 # Student details
@@ -236,6 +242,11 @@ while True:
             )
         )
 
+        # Registration still stores exactly ONE embedding, and a fresh
+        # enrollment invalidates any references harvested against the old
+        # photo -- reset them so the set starts clean.
+        ref_store.clear_student(connection, student_id)
+
         connection.commit()
         connection.close()
 
@@ -246,6 +257,7 @@ while True:
         print("Student ID :", student_id)
         print("Name       :", name)
         print("Embedding  : Stored (unit-normalized)")
+        print("References : reset (0 harvested)")
         print("==============================")
 
         # Small delay so user can see success

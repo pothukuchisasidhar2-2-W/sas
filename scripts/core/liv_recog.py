@@ -1,11 +1,22 @@
+import sys
+from pathlib import Path
+
 import cv2
 import sqlite3
 import numpy as np
 from datetime import datetime
 
-YUNET_MODEL = "models/face_detection_yunet_2026may.onnx"
-SFACE_MODEL = "models/face_recognition_sface_2021dec.onnx"
-DB_PATH = "attendance.db"
+# Same repo-root anchoring as register.py so the script works from any cwd.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+YUNET_MODEL = str(PROJECT_ROOT / "models" / "face_detection_yunet_2026may.onnx")
+SFACE_MODEL = str(PROJECT_ROOT / "models" / "face_recognition_sface_2021dec.onnx")
+DB_PATH = str(PROJECT_ROOT / "attendance.db")
+
+# Sibling module (scripts/core/ref_store.py) holds the harvest policy and
+# the vectorized matcher; running this file as a script puts its directory
+# on sys.path already, but be explicit so `python -m` works too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ref_store
 
 
 
@@ -53,6 +64,30 @@ def open_db():
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+
+def _refresh_student_rows(conn, student_id, name, rows):
+    """Rebuild the matching rows for one student from the database.
+
+    Called after a harvest so a new reference starts matching immediately
+    without restarting the process.
+    """
+    rows = [row for row in rows if row[0] != student_id]
+
+    primary = conn.execute(
+        "SELECT embedding FROM students WHERE student_id = ?",
+        (student_id,),
+    ).fetchone()
+    if primary is None:
+        return rows
+
+    rows.append(ref_store.as_match_rows(
+        student_id, name, np.frombuffer(primary[0], dtype=np.float32)
+    ))
+    for vector in ref_store.load_student_references(conn, student_id):
+        rows.append(ref_store.as_match_rows(student_id, name, vector))
+    return rows
 
 
 
@@ -118,6 +153,10 @@ print("SQLite journal mode:", cursor.fetchone()[0])
 
 _ensure_attendance_uniqueness_constraint(connection)
 
+# Make sure the reference-harvesting table exists even on databases that
+# were created before this feature (idempotent, safe to run every startup).
+ref_store.ensure_schema(connection)
+
 cursor.execute("""
     SELECT student_id, name, embedding
     FROM students
@@ -132,6 +171,7 @@ if not students:
 
 
 registered_students = []
+names = {}
 
 for student_id, name, embedding_bytes in students:
 
@@ -145,13 +185,32 @@ for student_id, name, embedding_bytes in students:
     norm = float(np.linalg.norm(embedding, ord=2))
     if norm > 0:
         embedding = embedding / norm
+
+    names[student_id] = name
     registered_students.append(
-        (student_id, name, embedding)
+        ref_store.as_match_rows(student_id, name, embedding)
     )
 
 
 
-print(f"{len(registered_students)} student(s) loaded.")
+# Previously harvested reference views (extra poses/lighting captured in
+# earlier runs). They match exactly like the registration embedding.
+reference_count = 0
+for student_id, ref_vector in ref_store.load_all_references(connection):
+    if student_id in names:
+        registered_students.append(
+            ref_store.as_match_rows(student_id, names[student_id], ref_vector)
+        )
+        reference_count += 1
+
+
+
+harvest = ref_store.HarvestState()
+
+print(
+    f"{len(names)} student(s) loaded "
+    f"({reference_count} extra reference embedding(s))."
+)
 print("Starting live recognition...")
 print("Attendance system active.")
 print("Press Q to quit.")
@@ -225,27 +284,15 @@ while True:
             # -----------------------------
             # Find best student
             # -----------------------------
-            best_student = None
-            best_score = -1
+            # One vectorized cosine against every stored embedding (the
+            # registration one plus any harvested references) instead of a
+            # per-student cv2.match() call.
+            best_score, student_id, name = ref_store.best_match(
+                registered_students,
+                live_embedding
+            )
 
-
-
-            for student_id, name, registered_embedding in registered_students:
-
-                score = recognizer.match(
-                    live_embedding,
-                    registered_embedding,
-                    cv2.FaceRecognizerSF_FR_COSINE
-                )
-
-                if score > best_score:
-
-                    best_score = score
-
-                    best_student = (
-                        student_id,
-                        name
-                    )
+            best_student = (student_id, name) if best_score >= 0 else None
 
 
 
@@ -254,17 +301,10 @@ while True:
             # -----------------------------
             if best_score >= MATCH_THRESHOLD:
 
-                student_id, name = best_student
-
                 label = f"{name} ({student_id})"
 
                 box_color = (0, 255, 0)
 
-
-
-                # -----------------------------
-                # Mark Attendance
-                # -----------------------------
                 now = datetime.now()
 
                 today = now.strftime("%Y-%m-%d")
@@ -272,50 +312,80 @@ while True:
 
 
 
+                # -----------------------------
+                # Harvest a new reference view
+                # -----------------------------
+                # Independent of attendance marking: a confident, *different*
+                # view of an already-marked student is still worth keeping.
+                # ref_store decides (score gate, cooldown, redundancy, cap).
+                action, _new_vector = harvest.maybe_store(
+                    connection,
+                    student_id,
+                    live_embedding,
+                    best_score,
+                )
+
+                if action:
+                    registered_students = _refresh_student_rows(
+                        connection, student_id, name, registered_students
+                    )
+                    stored = len(
+                        ref_store.load_student_references(connection, student_id)
+                    )
+                    print(
+                        f"REFERENCE {action.upper()}: {name} ({student_id}) "
+                        f"[{stored}/{ref_store.MAX_REFERENCES} stored]"
+                    )
+
+
+
+                # -----------------------------
+                # Mark Attendance
+                # -----------------------------
                 # Only insert if we have not already marked today for this
                 # student in this run of the process. Persisted uniqueness
                 # is enforced by the schema constraint that `database.py`
                 # will create on the next schema update.
-                if student_id in marked_today:
-                    continue
+                if student_id not in marked_today:
 
-                cursor = connection.cursor()
+                    cursor = connection.cursor()
 
-                # Application-layer uniqueness guard in case the index was
-                # not created (e.g. legacy DB without the migration). When
-                # this guard or the index is both active, cancellation of a
-                # duplicate insert is handled by the index / UniqueError.
-                existing = cursor.execute(
-                    """
-                        SELECT 1 FROM attendance
-                        WHERE student_id = ? AND date = ?
-                        LIMIT 1
-                    """,
-                    (student_id, today),
-                ).fetchone()
+                    # Application-layer uniqueness guard in case the index
+                    # was not created (e.g. legacy DB without the migration).
+                    # When this guard or the index is both active, cancellation
+                    # of a duplicate insert is handled by the index.
+                    existing = cursor.execute(
+                        """
+                            SELECT 1 FROM attendance
+                            WHERE student_id = ? AND date = ?
+                            LIMIT 1
+                        """,
+                        (student_id, today),
+                    ).fetchone()
 
-                if existing:
-                    marked_today.add(student_id)
-                    continue
+                    if existing:
+                        marked_today.add(student_id)
 
-                cursor.execute(
-                    """
-                        INSERT INTO attendance
-                        (student_id, date, in_time, out_time)
-                        VALUES (?, ?, ?, NULL)
-                    """,
-                    (student_id, today, current_time),
-                )
+                    else:
 
-                connection.commit()
+                        cursor.execute(
+                            """
+                                INSERT INTO attendance
+                                (student_id, date, in_time, out_time)
+                                VALUES (?, ?, ?, NULL)
+                            """,
+                            (student_id, today, current_time),
+                        )
 
-                marked_today.add(student_id)
+                        connection.commit()
 
-                print(
-                    f"ATTENDANCE MARKED: "
-                    f"{name} ({student_id}) "
-                    f"IN at {current_time}"
-                )
+                        marked_today.add(student_id)
+
+                        print(
+                            f"ATTENDANCE MARKED: "
+                            f"{name} ({student_id}) "
+                            f"IN at {current_time}"
+                        )
 
 
 

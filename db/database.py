@@ -31,6 +31,25 @@ def create_database(db_path=DB_PATH):
         )
     """)
 
+    # Reference embeddings harvested during live recognition. Registration
+    # still stores exactly one canonical embedding per student in `students`;
+    # this table holds a small capped set of extra views captured only when
+    # they add genuinely new information (see scripts/core/ref_store.py).
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS student_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            source TEXT NOT NULL DEFAULT 'recognition',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    connection.execute("""
+        CREATE INDEX IF NOT EXISTS idx_student_embeddings_student
+        ON student_embeddings(student_id)
+    """)
+
     connection.commit()
     connection.close()
 
