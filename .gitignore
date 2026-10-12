@@ -5,6 +5,10 @@ __pycache__/
 # App-internal metadata
 .freebuff/
 
+# Editor / debugging scratch (local only; not part of the project)
+.tempCodeRunnerFile.py
+.codebuff/
+
 # SQLite sidecar files (WAL/SHM) — attendance.db itself is tracked today,
 # but the transient journal files never belong in git.
 *.db-wal

@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Design tokens.
+
+   Deliberately minimal: one accent, one neutral ramp, and a small set of
+   semantic colours reserved ONLY for attendance status. Keeping statuses off
+   the brand hue means a green badge never reads as "the app's colour".
+
+   The accent is indigo: education/university branding leans blue for trust and
+   calm, and indigo stays clearly distinct from the present/absent/late greens,
+   reds and ambers. Canvas/surface/border follow the near-white, hairline-border
+   convention of minimal product dashboards (Linear / Vercel / Stripe), but with
+   the lightness pushed up so long roster tables stay readable.
+--------------------------------------------------------------------------- */
+@theme {
+  /* Surfaces */
+  --color-canvas: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-line: #e4e7ec;
+  --color-line-strong: #d0d5dd;
+
+  /* Text */
+  --color-ink: #101828;
+  --color-muted: #667085;
+  --color-faint: #98a2b3;
+
+  /* Brand — the single accent */
+  --color-brand: #4f46e5;
+  --color-brand-hover: #4338ca;
+  --color-brand-soft: #eef2ff;
+  --color-brand-ring: #c7d2fe;
+
+  /* Semantic — attendance status only */
+  --color-present: #067647;
+  --color-present-bg: #ecfdf3;
+  --color-absent: #b42318;
+  --color-absent-bg: #fef3f2;
+  --color-late: #b54708;
+  --color-late-bg: #fffaeb;
+  --color-excused: #175cd3;
+  --color-excused-bg: #eff8ff;
+  --color-pending: #475467;
+  --color-pending-bg: #f2f4f7;
+
+  /* Type + shape */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --radius-field: 0.5rem;
+  --radius-card: 0.75rem;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus rings: one consistent treatment, never removed. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+/* Slim, neutral scrollbars so panels don't shout. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}

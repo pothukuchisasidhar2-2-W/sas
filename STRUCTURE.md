@@ -62,6 +62,25 @@ If you keep those two in mind, every script makes sense.
 
 ## What moves where, in the real pipeline
 
+From the repository root in PowerShell, activate the venv, change to this
+project directory, and install its dependencies:
+
+```
+.\venv\Scripts\Activate.ps1
+Set-Location .\cam_recognization
+python -m pip install -r requirements.txt
+```
+
+`opencv-contrib-python` supplies the `cv2` module and the YuNet/SFace APIs used
+by the enrollment and recognition scripts.
+
+Run scripts with `cam_recognization` as the working directory so the relative
+model and database paths resolve correctly. To enroll a student, run:
+
+```
+python .\scripts\core\register.py
+```
+
 Day-to-day usage order:
 
 ```
