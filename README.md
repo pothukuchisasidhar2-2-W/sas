@@ -75,6 +75,13 @@ Those approved values, not values supplied by the browser, determine teacher
 permissions. The first teacher invited with a department name is its department
 lead. Further teachers can join using a department invitation code.
 
+For a local test pair, run `python scripts/admin/seed_demo_accounts.py` and
+choose passwords when prompted. It creates `demo.student@trueeye.local` and
+`demo.teacher@trueeye.local` for `CSE-AIDS-2-A`; the student starts pending so
+the teacher can test approval and removal. The student still needs to capture a
+face before camera recognition can identify that demo roll number. Do not use
+these accounts on a production database.
+
 ## Timetables and attendance
 
 Teachers can import CSV from **Teacher → Timetable**. Review a validation
