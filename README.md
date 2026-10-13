@@ -111,11 +111,17 @@ origins. The frontend reads `VITE_API_URL` and `VITE_ATTENDANCE_THRESHOLD` from
 `web/.env.local`. Keep production secrets, database files, and `.env.local`
 outside version control.
 
-API bearer tokens expire after eight hours. Passwords use PBKDF2-HMAC-SHA256.
-Tokens are currently held in browser local storage to match the existing app;
-deployments exposed beyond a trusted local network should review the complete
-session and browser security model before use. There is no email verification,
-admin portal, liveness detection, or biometric retention scheduler. Face
+Signup accepts Gmail addresses only and requires a one-time inbox code before
+creating an account. Password reset also uses a one-time Gmail code. Configure
+`TRUE_EYE_GMAIL_ADDRESS` and `TRUE_EYE_GMAIL_APP_PASSWORD` on the API host;
+the password must be a Google App Password, and these values must never be
+committed. Codes expire after ten minutes and resend is rate limited.
+
+API bearer tokens expire after 30 days and are restored from browser local
+storage when the site opens, so users remain signed in across reloads during
+that period. Passwords use PBKDF2-HMAC-SHA256. Deployments exposed beyond a
+trusted local network should review the complete session and browser security
+model before use. There is no admin portal, liveness detection, or biometric retention scheduler. Face
 embeddings remain sensitive biometric data in the local SQLite file.
 
 ## Verification

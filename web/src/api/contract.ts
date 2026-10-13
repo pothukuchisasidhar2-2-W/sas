@@ -42,6 +42,7 @@ export class HttpError extends Error implements ApiError {
 export interface SignupStudentInput {
   name: string;
   email: string;
+  emailCode: string;
   password: string;
   branch: string;
   year: number;
@@ -53,6 +54,7 @@ export interface SignupStudentInput {
 export interface SignupTeacherInput {
   name: string;
   email: string;
+  emailCode: string;
   password: string;
   departmentName: string;
   assignments: Array<{

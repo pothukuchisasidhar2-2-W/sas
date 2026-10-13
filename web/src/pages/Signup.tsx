@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
-import { MOCK_BRANCHES, MOCK_SECTIONS, MOCK_YEARS, USING_MOCK, errorMessage } from "../api/client";
+import { MOCK_BRANCHES, MOCK_SECTIONS, MOCK_YEARS, USING_MOCK, errorMessage, requestAuthCode } from "../api/client";
 import { Wordmark } from "../components/AppShell";
 import { Alert, Button, Card, Field, Input, Select, cx } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -31,6 +31,8 @@ export default function Signup() {
   const [role, setRole] = useState<Role>("student");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [emailCode, setEmailCode] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
   const [password, setPassword] = useState("");
   const [inviteCode, setInviteCode] = useState("");
 
@@ -46,6 +48,20 @@ export default function Signup() {
 
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sendingCode, setSendingCode] = useState(false);
+
+  const sendCode = async () => {
+    setError(null);
+    setSendingCode(true);
+    try {
+      await requestAuthCode(email.trim(), "signup");
+      setCodeSent(true);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setSendingCode(false);
+    }
+  };
 
   const updateAssignment = (index: number, patch: Partial<AssignmentDraft>) => {
     setAssignments((current) =>
@@ -69,6 +85,7 @@ export default function Signup() {
         const user = await signupStudent({
           name: name.trim(),
           email: email.trim(),
+          emailCode,
           password,
           branch,
           year,
@@ -86,6 +103,7 @@ export default function Signup() {
         const user = await signupTeacher({
           name: name.trim(),
           email: email.trim(),
+          emailCode,
           password,
           departmentName,
           assignments: cleaned.map((a) => ({
@@ -155,10 +173,22 @@ export default function Signup() {
                   autoComplete="email"
                   value={email}
                   onChange={(event) => setEmail(event.target.value)}
-                  placeholder="you@college.edu"
+                  placeholder="you@gmail.com"
                 />
               </Field>
             </div>
+
+            {!USING_MOCK && <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+              <Field label="Gmail verification code" required hint="Send a one-time code to verify you control this Gmail inbox. Codes expire in 10 minutes.">
+                <Input required inputMode="numeric" autoComplete="one-time-code" maxLength={6} pattern="[0-9]{6}" value={emailCode} onChange={(event) => setEmailCode(event.target.value)} placeholder="6-digit code" />
+              </Field>
+              <Button type="button" variant="secondary" loading={sendingCode} onClick={sendCode} disabled={!email.includes("@")}>{codeSent ? "Resend code" : "Send code"}</Button>
+            </div>}
+            {USING_MOCK && <div className="flex gap-3">
+              <Field label="Gmail verification code" required hint="In demo mode, enter any six digits.">
+                <Input required inputMode="numeric" maxLength={6} pattern="[0-9]{6}" value={emailCode} onChange={(event) => setEmailCode(event.target.value)} placeholder="123456" />
+              </Field>
+            </div>}
 
             <Field
               label="Password"

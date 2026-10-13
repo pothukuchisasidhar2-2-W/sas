@@ -13,8 +13,11 @@ import io
 import json
 import os
 import secrets
+import smtplib
 import sqlite3
+import ssl
 import uuid
+from email.message import EmailMessage
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -30,7 +33,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = Path(os.environ.get("TRUE_EYE_DB", ROOT / "attendance.db")).resolve()
 MODEL_DETECT = ROOT / "models" / "face_detection_yunet_2026may.onnx"
 MODEL_RECOGNIZE = ROOT / "models" / "face_recognition_sface_2021dec.onnx"
-SESSION_HOURS = 8
+SESSION_DAYS = 30
+OTP_MINUTES = 10
 ATTENDANCE_THRESHOLD = float(os.environ.get("TRUE_EYE_ATTENDANCE_THRESHOLD", "75"))
 
 
@@ -62,6 +66,11 @@ CREATE TABLE IF NOT EXISTS api_sessions (
   expires_at TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_api_sessions_user ON api_sessions(user_id);
+CREATE TABLE IF NOT EXISTS email_codes (
+  email TEXT NOT NULL COLLATE NOCASE, purpose TEXT NOT NULL CHECK(purpose IN ('signup','reset')),
+  code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(email,purpose)
+);
 CREATE TABLE IF NOT EXISTS activation_invites (
   code_hash TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('student','teacher')),
   payload TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
@@ -187,7 +196,17 @@ class LoginInput(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
+class EmailInput(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class ResetPasswordInput(EmailInput):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+    password: str = Field(min_length=8, max_length=256)
+
+
 class StudentSignup(LoginInput):
+    emailCode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
     name: str = Field(min_length=1, max_length=120)
     branch: str = Field(min_length=1, max_length=32)
     year: int = Field(ge=1, le=8)
@@ -196,6 +215,7 @@ class StudentSignup(LoginInput):
 
 
 class TeacherSignup(LoginInput):
+    emailCode: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
     name: str = Field(min_length=1, max_length=120)
     departmentName: str = Field(default="", max_length=100)
     inviteCode: str = Field(min_length=16, max_length=128)
@@ -320,9 +340,67 @@ def session_user(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
 def make_session(db: sqlite3.Connection, user_id: str) -> dict[str, Any]:
     token = secrets.token_urlsafe(36)
     db.execute("INSERT INTO api_sessions(token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)",
-      (digest_token(token), user_id, (datetime.now(timezone.utc)+timedelta(hours=SESSION_HOURS)).replace(microsecond=0).isoformat(), now_iso()))
+      (digest_token(token), user_id, (datetime.now(timezone.utc)+timedelta(days=SESSION_DAYS)).replace(microsecond=0).isoformat(), now_iso()))
     row = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     return {"token": token, "user": session_user(db, row)}
+
+
+def gmail_address(value: str) -> str:
+    email = value.strip().lower()
+    local = email[:-10] if email.endswith("@gmail.com") else ""
+    if (not local or len(local) > 64 or email.count("@") != 1 or len(email) > 254
+        or local.startswith(".") or local.endswith(".") or ".." in local
+        or any(not (char.isalnum() or char in ".!#$%&'*+/=?^_`{|}~-") for char in local)):
+        raise HTTPException(422, "Use a valid @gmail.com address so we can verify your inbox.")
+    return email
+
+
+def send_email_code(email: str, purpose: str) -> None:
+    sender = os.environ.get("TRUE_EYE_GMAIL_ADDRESS", "").strip()
+    app_password = os.environ.get("TRUE_EYE_GMAIL_APP_PASSWORD", "").replace(" ", "")
+    if not sender or not app_password:
+        raise HTTPException(503, "Email verification is not configured. Set TRUE_EYE_GMAIL_ADDRESS and TRUE_EYE_GMAIL_APP_PASSWORD on the API server.")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    with connect() as db:
+        prior = db.execute("SELECT created_at FROM email_codes WHERE email=? AND purpose=?", (email,purpose)).fetchone()
+        if prior:
+            try:
+                sent = datetime.fromisoformat(prior["created_at"])
+                if datetime.now(timezone.utc) - sent < timedelta(seconds=60):
+                    raise HTTPException(429, "Wait a minute before requesting another code.")
+            except ValueError:
+                pass
+        db.execute("INSERT INTO email_codes(email,purpose,code_hash,expires_at,created_at,attempts) VALUES (?,?,?,?,?,0) ON CONFLICT(email,purpose) DO UPDATE SET code_hash=excluded.code_hash,expires_at=excluded.expires_at,created_at=excluded.created_at,attempts=0",
+          (email,purpose,digest_token(code),(datetime.now(timezone.utc)+timedelta(minutes=OTP_MINUTES)).replace(microsecond=0).isoformat(),now_iso()))
+    message = EmailMessage()
+    message["Subject"] = "True Eye email verification code" if purpose == "signup" else "True Eye password reset code"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(f"Your True Eye code is {code}. It expires in {OTP_MINUTES} minutes. If you did not request this, ignore this email.")
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=15) as smtp:
+            smtp.login(sender, app_password)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException):
+        with connect() as db:
+            db.execute("DELETE FROM email_codes WHERE email=? AND purpose=?", (email,purpose))
+        raise HTTPException(502, "Could not send the email code. Check Gmail SMTP settings and try again.")
+
+
+def consume_email_code(db: sqlite3.Connection, email: str, purpose: str, code: str) -> None:
+    row = db.execute("SELECT * FROM email_codes WHERE email=? AND purpose=?", (email,purpose)).fetchone()
+    if row is None or row["expires_at"] <= now_iso() or row["attempts"] >= 5:
+        raise HTTPException(400, "The code is invalid or expired. Request a new one.")
+    if not hmac.compare_digest(row["code_hash"], digest_token(code)):
+        attempts = row["attempts"] + 1
+        if attempts >= 5:
+            db.execute("DELETE FROM email_codes WHERE email=? AND purpose=?", (email,purpose))
+        else:
+            db.execute("UPDATE email_codes SET attempts=? WHERE email=? AND purpose=?", (attempts,email,purpose))
+        # Keep failed guesses across the HTTP error rollback in connect().
+        db.commit()
+        raise HTTPException(400, "The code is invalid or expired. Request a new one.")
+    db.execute("DELETE FROM email_codes WHERE email=? AND purpose=?", (email,purpose))
 
 
 def consume_invite(db: sqlite3.Connection, code: str, role: str) -> dict[str, Any]:
@@ -347,14 +425,49 @@ def login(body: LoginInput) -> dict[str, Any]:
         return make_session(db, user["id"])
 
 
+@app.post("/api/auth/signup/code", status_code=202)
+def signup_code(body: EmailInput) -> dict[str, str]:
+    email = gmail_address(body.email)
+    with connect() as db:
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (email,)).fetchone():
+            raise HTTPException(409, "An account already uses that email address.")
+    send_email_code(email, "signup")
+    return {"message": "If this Gmail can be used, a verification code has been sent."}
+
+
+@app.post("/api/auth/password-reset/code", status_code=202)
+def password_reset_code(body: EmailInput) -> dict[str, str]:
+    email = gmail_address(body.email)
+    with connect() as db:
+        exists = db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE AND active=1", (email,)).fetchone()
+    if exists:
+        send_email_code(email, "reset")
+    return {"message": "If an account uses that Gmail, a password reset code has been sent."}
+
+
+@app.post("/api/auth/password-reset")
+def password_reset(body: ResetPasswordInput) -> dict[str, str]:
+    email = gmail_address(body.email)
+    with connect() as db:
+        consume_email_code(db, email, "reset", body.code)
+        user = db.execute("SELECT id FROM users WHERE email=? COLLATE NOCASE AND active=1", (email,)).fetchone()
+        if user is None:
+            raise HTTPException(400, "The code is invalid or expired. Request a new one.")
+        db.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_secret(body.password), user["id"]))
+        db.execute("DELETE FROM api_sessions WHERE user_id=?", (user["id"],))
+    return {"message": "Password updated. Sign in with your new password."}
+
+
 def signup_common(body: StudentSignup | TeacherSignup, role: str) -> dict[str, Any]:
+    email = gmail_address(body.email)
     with connect() as db:
         payload = consume_invite(db, body.inviteCode, role) if role == "teacher" else {}
-        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (body.email,)).fetchone():
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (email,)).fetchone():
             raise HTTPException(409, "An account already uses that email address.")
+        consume_email_code(db, email, "signup", body.emailCode)
         user_id = uid()
         db.execute("INSERT INTO users(id,email,password_hash,role,name,created_at) VALUES (?,?,?,?,?,?)",
-                   (user_id, body.email.lower(), hash_secret(body.password), role, body.name.strip(), now_iso()))
+                   (user_id, email, hash_secret(body.password), role, body.name.strip(), now_iso()))
         if role == "student":
             assert isinstance(body, StudentSignup)
             sid = body.studentId.strip()

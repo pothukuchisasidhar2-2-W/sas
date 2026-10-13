@@ -6,6 +6,7 @@ import StudentLayout from "./layouts/StudentLayout";
 import TeacherLayout from "./layouts/TeacherLayout";
 import Landing from "./pages/Landing";
 import Login from "./pages/Login";
+import ForgotPassword from "./pages/ForgotPassword";
 import NotFound from "./pages/NotFound";
 import Signup from "./pages/Signup";
 import StudentAttendance from "./pages/student/StudentAttendance";
@@ -83,6 +84,7 @@ export default function App() {
           </PublicOnly>
         }
       />
+      <Route path="/forgot-password" element={<PublicOnly><ForgotPassword /></PublicOnly>} />
 
       {/* Student area */}
       <Route

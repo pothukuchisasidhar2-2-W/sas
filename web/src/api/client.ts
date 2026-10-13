@@ -25,6 +25,18 @@ export function setAuthToken(token: string | null) {
   authToken = token;
 }
 
+export async function requestAuthCode(email: string, purpose: "signup" | "reset"): Promise<void> {
+  if (USING_MOCK) return;
+  await request(purpose === "signup" ? "/api/auth/signup/code" : "/api/auth/password-reset/code", {
+    method: "POST", body: JSON.stringify({ email }),
+  });
+}
+
+export async function completePasswordReset(email: string, code: string, password: string): Promise<void> {
+  if (USING_MOCK) throw new Error("Password reset is available when connected to the True Eye API.");
+  await request("/api/auth/password-reset", { method: "POST", body: JSON.stringify({ email, code, password }) });
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
