@@ -1,0 +1,17 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "terminal.integrated.defaultProfile.windows": "PowerShell",
+
+    // Code Runner: run the WHOLE saved file in the integrated terminal.
+    // $fullFileName is the documented placeholder (not %file%); python -u is
+    // the documented default executor. ignoreSelection is what stops Code
+    // Runner from creating tempCodeRunnerFile.py (it creates that file only
+    // when running a text selection instead of the saved file).
+    "code-runner.runInTerminal": true,
+    "code-runner.ignoreSelection": true,
+    "code-runner.saveFileBeforeRun": true,
+    "code-runner.fileDirectoryAsCwd": true,
+    "code-runner.executorMap": {
+        "python": "python -u $fullFileName"
+    }
+}
