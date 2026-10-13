@@ -39,6 +39,7 @@ import type {
   DeptPermissions,
   DeptPost,
   DeptPostKind,
+  DeptReply,
   Role,
   SessionUser,
   StudentProfile,
@@ -61,12 +62,14 @@ interface Persisted {
   departments: Department[];
   members: MemberRecord[];
   posts: DeptPost[];
+  replies?: DeptReply[];
   attendanceOverrides: AttendanceRecord[];
 }
 
 /** The live in-memory database: generated history + persisted mutations. */
 let db: SeedDatabase;
 let attendanceOverrides: AttendanceRecord[] = [];
+let replies: DeptReply[] = [];
 
 function loadPersisted(): Persisted | null {
   try {
@@ -89,6 +92,7 @@ function persist() {
     departments: db.departments,
     members: db.members,
     posts: db.posts,
+    replies,
     attendanceOverrides,
   };
   try {
@@ -101,6 +105,7 @@ function persist() {
 function init() {
   db = createSeedDatabase();
   attendanceOverrides = [];
+  replies = [];
   const saved = loadPersisted();
   if (saved) {
     db.users = saved.users;
@@ -112,6 +117,7 @@ function init() {
     db.departments = saved.departments;
     db.members = saved.members;
     db.posts = saved.posts;
+    replies = saved.replies ?? [];
     attendanceOverrides = saved.attendanceOverrides ?? [];
   }
   for (const record of attendanceOverrides) {
@@ -750,6 +756,17 @@ export const mockApi: Api = {
     return result;
   },
 
+  async previewTimetable(token, input) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    const section = sectionOptionsForTeacher(user.profile).find((item) => item.id === input.sectionId);
+    if (!section) fail(403, "That class is outside your teaching assignments.");
+    const lines = input.csv.trim().split(/\r?\n/).slice(1).filter(Boolean);
+    if (!lines.length) return { imported: 0, replaced: 0, errors: ["Add at least one timetable row."] };
+    return { imported: lines.length, replaced: 0, errors: [] };
+  },
+
   /* -------------------------------------------------------------- department */
 
   async myDepartment(token) {
@@ -891,6 +908,35 @@ export const mockApi: Api = {
     return db.posts
       .filter((p) => p.deptId === user.profile.departmentId)
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  },
+
+  async deptReplies(token, postId) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    const post = postFor(postId);
+    if (post.deptId !== user.profile.departmentId) fail(404, "Discussion not found.");
+    return replies.filter((reply) => reply.postId === postId).map((reply) => ({ ...reply }));
+  },
+
+  async createDeptReply(token, postId, body) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    const post = postFor(postId);
+    if (post.deptId !== user.profile.departmentId) fail(404, "Discussion not found.");
+    if (!body.trim()) fail(400, "Write a reply first.");
+    const reply: DeptReply = {
+      id: `reply-${Date.now().toString(36)}`,
+      postId,
+      authorUserId: user.profile.userId,
+      authorName: user.profile.name,
+      body: body.trim(),
+      createdAt: new Date().toISOString(),
+    };
+    replies.push(reply);
+    persist();
+    return { ...reply };
   },
 
   async createDeptPost(token, input) {

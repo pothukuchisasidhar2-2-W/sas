@@ -87,7 +87,7 @@ function JoinOrCreate({
         <Card>
           <CardHeader
             title="Create a department"
-            description="You become its HOD and get a join code to share."
+            description="You become its HOD and can generate a one-time join code to share."
           />
           <CardBody className="flex flex-col gap-4">
             <Field label="Department name" required>
@@ -311,6 +311,44 @@ function AccessTab({
 
 /* ------------------------------------------------------------------ board tab */
 
+function DiscussionReplies({ postId }: { postId: string }) {
+  const token = useToken();
+  const replies = useApiData([token, postId], () => api.deptReplies(token, postId));
+  const [body, setBody] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.createDeptReply(token, postId, body);
+      setBody("");
+      replies.reload();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-4 border-t border-line pt-3">
+      {(replies.data ?? []).map((reply) => (
+        <div key={reply.id} className="mb-2 rounded-field bg-canvas px-3 py-2">
+          <p className="text-[11px] font-medium text-ink">{reply.authorName} <span className="font-normal text-faint">· {timeAgo(reply.createdAt)}</span></p>
+          <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-muted">{reply.body}</p>
+        </div>
+      ))}
+      {error && <Alert tone="error">{error}</Alert>}
+      <div className="mt-2 flex items-end gap-2">
+        <Textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Reply to this discussion…" className="min-h-16" />
+        <Button size="sm" onClick={submit} loading={busy} disabled={!body.trim()}>Reply</Button>
+      </div>
+    </div>
+  );
+}
+
 function BoardTab({ canPost, onChanged }: { canPost: boolean; onChanged: () => void }) {
   const token = useToken();
   const posts = useApiData([token], () => api.deptPosts(token));
@@ -404,6 +442,7 @@ function BoardTab({ canPost, onChanged }: { canPost: boolean; onChanged: () => v
                     </Button>
                   )}
                 </div>
+                <DiscussionReplies postId={item.id} />
               </li>
             ))}
           </ul>
@@ -473,8 +512,11 @@ function AnalyticsTab() {
     );
   }
 
-  const worst = rows.reduce((min, row) => Math.min(min, row.presentRate ?? 100), 100);
-  const totalAtRisk = rows.reduce((total, row) => total + row.atRiskCount, 0);
+  const observedRates = rows.flatMap((row) => row.presentRate === null ? [] : [row.presentRate]);
+  const worst = observedRates.length > 0 ? Math.min(...observedRates) : null;
+  const knownRiskRows = rows.filter((row) => row.atRiskCount !== null);
+  const totalAtRisk = knownRiskRows.reduce((total, row) => total + (row.atRiskCount ?? 0), 0);
+  const incomplete = knownRiskRows.length < rows.length;
 
   return (
     <>
@@ -486,8 +528,9 @@ function AnalyticsTab() {
           tone={percentageTone(worst).text}
         />
         <StatTile
-          label="Students below 75%"
-          value={totalAtRisk}
+          label="Students below threshold"
+          value={incomplete ? `${totalAtRisk}+` : totalAtRisk}
+          hint={incomplete ? "More marks needed for a complete count" : undefined}
           tone={totalAtRisk > 0 ? "text-absent" : "text-present"}
         />
         <StatTile
@@ -508,7 +551,7 @@ function AnalyticsTab() {
               <Th>Subject</Th>
               <Th align="right">Sessions</Th>
               <Th>Attendance</Th>
-              <Th align="right">Below 75%</Th>
+              <Th align="right">Below threshold</Th>
             </tr>
           </thead>
           <tbody>
@@ -538,7 +581,9 @@ function AnalyticsTab() {
                     </div>
                   </Td>
                   <Td align="right">
-                    {row.atRiskCount > 0 ? (
+                    {row.atRiskCount === null ? (
+                      <span className="text-muted">Incomplete</span>
+                    ) : row.atRiskCount > 0 ? (
                       <Badge tone="absent">
                         {row.atRiskCount} of {row.strength}
                       </Badge>
@@ -565,6 +610,7 @@ export default function TeacherDepartment() {
   const token = useToken();
   const [tab, setTab] = useState<TabId>("access");
   const [copied, setCopied] = useState(false);
+  const [joinCode, setJoinCode] = useState("");
   const [codeError, setCodeError] = useState<string | null>(null);
   const [rotating, setRotating] = useState(false);
 
@@ -609,7 +655,7 @@ export default function TeacherDepartment() {
 
   const copyCode = async () => {
     try {
-      await navigator.clipboard.writeText(dept.joinCode);
+      await navigator.clipboard.writeText(joinCode || dept.joinCode);
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     } catch {
@@ -621,8 +667,8 @@ export default function TeacherDepartment() {
     setRotating(true);
     setCodeError(null);
     try {
-      await api.rotateDeptCode(token);
-      reloadAll();
+      const rotated = await api.rotateDeptCode(token);
+      setJoinCode(rotated.joinCode);
     } catch (cause) {
       setCodeError(errorMessage(cause));
     } finally {
@@ -652,9 +698,9 @@ export default function TeacherDepartment() {
           {teacher.isHod ? (
             <div className="flex flex-wrap items-center gap-3">
               <code className="rounded-field border border-line bg-canvas px-3.5 py-2 font-mono text-sm tracking-wide text-ink">
-                {dept.joinCode}
+                {joinCode || dept.joinCode || "Generate a code to share"}
               </code>
-              <Button variant="secondary" size="sm" onClick={copyCode}>
+              <Button variant="secondary" size="sm" onClick={copyCode} disabled={!joinCode && !dept.joinCode}>
                 {copied ? "Copied" : "Copy"}
               </Button>
               <Button variant="ghost" size="sm" onClick={rotate} loading={rotating}>

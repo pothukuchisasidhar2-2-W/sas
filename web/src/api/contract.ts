@@ -18,6 +18,7 @@ import type {
   DeptPermissions,
   DeptPost,
   DeptPostKind,
+  DeptReply,
   SessionUser,
   SubjectAttendanceSummary,
   TimetableSlot,
@@ -47,6 +48,8 @@ export interface SignupStudentInput {
   section: string;
   /** Becomes the primary key in the existing `students` table. */
   studentId: string;
+  /** One-time institutional activation code linked to this attendance identity. */
+  inviteCode: string;
 }
 
 export interface SignupTeacherInput {
@@ -61,6 +64,8 @@ export interface SignupTeacherInput {
     year: number;
     section: string;
   }>;
+  /** One-time teacher invitation; class permissions are read from this code. */
+  inviteCode: string;
 }
 
 export interface Session {
@@ -88,7 +93,7 @@ export interface DeptAnalytics {
   subjectName: string;
   sessionsHeld: number;
   presentRate: number | null;
-  atRiskCount: number;
+  atRiskCount: number | null;
   strength: number;
 }
 
@@ -160,6 +165,10 @@ export interface Api {
     token: string,
     input: { sectionId: string; csv: string },
   ): Promise<TimetableUploadResult>;
+  previewTimetable(
+    token: string,
+    input: { sectionId: string; csv: string },
+  ): Promise<TimetableUploadResult>;
 
   /* -------------------------------------------------------------- department */
   /** GET /api/departments/mine */
@@ -180,6 +189,8 @@ export interface Api {
   ): Promise<DeptMember>;
   /** GET /api/departments/posts */
   deptPosts(token: string): Promise<DeptPost[]>;
+  deptReplies(token: string, postId: string): Promise<DeptReply[]>;
+  createDeptReply(token: string, postId: string, body: string): Promise<DeptReply>;
   /** POST /api/departments/posts */
   createDeptPost(
     token: string,

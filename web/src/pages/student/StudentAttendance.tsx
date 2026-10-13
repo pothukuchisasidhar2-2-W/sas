@@ -78,8 +78,11 @@ export default function StudentAttendance() {
     return tally;
   }, [rows]);
 
-  const counted = counts.present + counts.late;
-  const denominator = rows.length - counts.excused;
+  // Legacy recognizer rows are per student/day and do not prove how many
+  // classes were held; only period-linked records support a percentage.
+  const scheduledRows = rows.filter((record) => Boolean(record.slotId));
+  const counted = scheduledRows.filter((record) => record.status === "present" || record.status === "late").length;
+  const denominator = scheduledRows.filter((record) => record.status !== "excused").length;
   const percentage = denominator > 0 ? (counted / denominator) * 100 : null;
 
   if (!student) return null;
@@ -88,7 +91,7 @@ export default function StudentAttendance() {
     <PageBody>
       <PageHeader
         title="Attendance"
-        description={`Every marked period for ${student.sectionId} in the selected window.`}
+        description={`Recognized days and scheduled periods for ${student.sectionId} in the selected window.`}
         actions={
           <div className="flex gap-1 rounded-field border border-line bg-surface p-1">
             {RANGES.map((option) => (
@@ -115,7 +118,7 @@ export default function StudentAttendance() {
         <StatTile
           label="Attendance"
           value={formatPercentage(percentage)}
-          hint={`${counted} of ${denominator} periods`}
+          hint={denominator ? `${counted} of ${denominator} marked class periods` : "No class-linked denominator available"}
         />
         <StatTile label="Present" value={counts.present} tone="text-present" />
         <StatTile label="Absent" value={counts.absent} tone="text-absent" />
@@ -128,7 +131,7 @@ export default function StudentAttendance() {
 
       <Card>
         <CardHeader
-          title="Period log"
+            title="Attendance log"
           description={`${formatDate(from)} – ${formatDate(to)}`}
           action={
             <div className="flex flex-wrap gap-1.5">
@@ -181,7 +184,7 @@ export default function StudentAttendance() {
                       {slot ? PERIOD_LABEL(slot.startTime, slot.endTime) : "—"}
                     </Td>
                     <Td>
-                      <span className="font-medium">{record.subjectId}</span>
+                      <span className="font-medium">{record.subjectId || "Unassigned recognition event"}</span>
                     </Td>
                     <Td>
                       <StatusBadge status={record.status} />

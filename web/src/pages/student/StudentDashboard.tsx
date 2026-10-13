@@ -29,6 +29,10 @@ import { useApiData } from "../../lib/useApiData";
 
 /** The 75% line most colleges use to decide exam eligibility. */
 const ELIGIBILITY = 75;
+const REQUESTED_THRESHOLD = Number(import.meta.env.VITE_ATTENDANCE_THRESHOLD ?? ELIGIBILITY);
+const ATTENDANCE_THRESHOLD = Number.isFinite(REQUESTED_THRESHOLD) && REQUESTED_THRESHOLD > 0 && REQUESTED_THRESHOLD < 100
+  ? REQUESTED_THRESHOLD
+  : ELIGIBILITY;
 
 export default function StudentDashboard() {
   const { user } = useAuth();
@@ -36,6 +40,7 @@ export default function StudentDashboard() {
   const [date, setDate] = useState(isoToday());
 
   const summary = useApiData([token], () => api.studentSummary(token));
+  const recent = useApiData([token], () => api.studentAttendance(token, "0001-01-01", isoToday()));
   const schedule = useApiData([token, date], () => api.studentSchedule(token, date));
 
   if (!user || user.role !== "student") return null;
@@ -59,7 +64,7 @@ export default function StudentDashboard() {
   const overall = totals.held > 0 ? (totals.attended / totals.held) * 100 : null;
   const overallTone = percentageTone(overall);
   const belowEligibility = subjects.filter(
-    (subject) => subject.percentage !== null && subject.percentage < ELIGIBILITY,
+    (subject) => subject.percentage !== null && subject.percentage < ATTENDANCE_THRESHOLD,
   );
 
   return (
@@ -180,16 +185,28 @@ export default function StudentDashboard() {
             <StatTile
               label="Overall"
               value={formatPercentage(overall)}
-              hint={`${totals.attended} of ${totals.held} periods`}
+              hint={totals.held ? `${totals.attended} of ${totals.held} marked class periods` : "No subject-linked class records yet"}
               tone={overallTone.text}
             />
             <StatTile
-              label="Subjects below 75%"
-              value={belowEligibility.length}
-              hint={belowEligibility.length === 0 ? "All clear" : "Needs attention"}
-              tone={belowEligibility.length > 0 ? "text-absent" : "text-present"}
+              label="Recognition days"
+              value={recent.data?.filter((record) => record.method === "face").length ?? "—"}
+              hint="Legacy camera records without class assignment"
+              tone="text-ink"
             />
           </div>
+
+          {belowEligibility.length > 0 && (
+            <Alert tone="warning" title={`${belowEligibility.length} subject${belowEligibility.length === 1 ? "" : "s"} below ${ATTENDANCE_THRESHOLD}%`}>
+              Attendance is compared with the institution threshold configured for this deployment.
+            </Alert>
+          )}
+
+          {totals.held === 0 && (recent.data?.length ?? 0) > 0 && (
+            <Alert tone="info" title="Class percentage is not available yet">
+              Camera attendance exists, but the existing recognizer records only a student and date. It does not identify a scheduled subject or count classes where nobody was recognized.
+            </Alert>
+          )}
 
           <Card>
             <CardHeader
@@ -219,7 +236,7 @@ export default function StudentDashboard() {
                           </p>
                           <p className="mt-0.5 text-[11px] text-muted">
                             {subject.subjectCode} · {subject.presentCount + subject.lateCount}/
-                            {subject.heldCount - subject.excusedCount} attended
+                            {subject.heldCount - subject.excusedCount} marked
                             {subject.excusedCount > 0 && ` · ${subject.excusedCount} excused`}
                           </p>
                         </div>
@@ -227,6 +244,11 @@ export default function StudentDashboard() {
                           {formatPercentage(subject.percentage)}
                         </span>
                       </div>
+                      {subject.percentage !== null && subject.percentage < ATTENDANCE_THRESHOLD && subject.percentage < 100 && (
+                        <p className="mt-1 text-[11px] text-muted">
+                          Estimate: attend the next {Math.max(0, Math.ceil((ATTENDANCE_THRESHOLD * (subject.heldCount - subject.excusedCount) / 100 - (subject.presentCount + subject.lateCount)) / (1 - ATTENDANCE_THRESHOLD / 100)))} classes to reach {ATTENDANCE_THRESHOLD}%, assuming no further absences.
+                        </p>
+                      )}
                       <div className="relative mt-2.5">
                         <ProgressBar
                           value={subject.percentage}
@@ -236,7 +258,7 @@ export default function StudentDashboard() {
                         {/* The eligibility line, drawn where 75% falls. */}
                         <span
                           className="absolute -top-0.5 h-2.5 w-px bg-line-strong"
-                          style={{ left: `${ELIGIBILITY}%` }}
+                          style={{ left: `${ATTENDANCE_THRESHOLD}%` }}
                           aria-hidden
                         />
                       </div>
@@ -247,7 +269,7 @@ export default function StudentDashboard() {
             )}
             <div className="border-t border-line px-5 py-3">
               <p className="text-[11px] text-faint">
-                The tick on each bar marks {ELIGIBILITY}%.
+                The tick marks the configured {ATTENDANCE_THRESHOLD}% threshold. Class percentages only include periods explicitly marked in True Eye.
               </p>
             </div>
           </Card>

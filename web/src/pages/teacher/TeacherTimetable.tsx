@@ -33,6 +33,7 @@ export default function TeacherTimetable() {
   const [sectionChoice, setSectionChoice] = useState("");
   const [csv, setCsv] = useState("");
   const [result, setResult] = useState<TimetableUploadResult | null>(null);
+  const [previewReady, setPreviewReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -78,11 +79,29 @@ export default function TeacherTimetable() {
     }
     setBusy(true);
     setError(null);
-    setResult(null);
     try {
       const outcome = await api.uploadTimetable(token, { sectionId, csv });
       setResult(outcome);
+      setPreviewReady(false);
       timetable.reload();
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const preview = async () => {
+    if (!sectionId) {
+      setError("Choose a class first.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setPreviewReady(false);
+    try {
+      setResult(await api.previewTimetable(token, { sectionId, csv }));
+      setPreviewReady(true);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -111,7 +130,11 @@ export default function TeacherTimetable() {
           <Field label="Class / section">
             <Select
               value={sectionId}
-              onChange={(event) => setSectionChoice(event.target.value)}
+              onChange={(event) => {
+                setSectionChoice(event.target.value);
+                setPreviewReady(false);
+                setResult(null);
+              }}
             >
               {(sections.data ?? []).map((section) => (
                 <option key={section.id} value={section.id}>
@@ -196,7 +219,11 @@ export default function TeacherTimetable() {
             >
               <Textarea
                 value={csv}
-                onChange={(event) => setCsv(event.target.value)}
+                onChange={(event) => {
+                  setCsv(event.target.value);
+                  setPreviewReady(false);
+                  setResult(null);
+                }}
                 spellCheck={false}
                 className="min-h-40 font-mono text-xs"
                 placeholder={HEADER}
@@ -204,15 +231,21 @@ export default function TeacherTimetable() {
             </Field>
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button onClick={upload} loading={busy} disabled={!csv.trim() || !sectionId}>
-                Import into {sectionId || "class"}
+              <Button onClick={preview} loading={busy} disabled={!csv.trim() || !sectionId}>
+                Preview import
               </Button>
+              {previewReady && result && result.imported + result.replaced > 0 && (
+                <Button variant="secondary" onClick={upload} loading={busy}>
+                  Confirm {result.imported + result.replaced} row{result.imported + result.replaced === 1 ? "" : "s"}
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 disabled={busy}
                 onClick={() => {
                   setCsv("");
                   setResult(null);
+                  setPreviewReady(false);
                   setError(null);
                 }}
               >
@@ -225,10 +258,12 @@ export default function TeacherTimetable() {
             {result && (
               <Alert
                 tone={result.errors.length > 0 ? "warning" : "success"}
-                title={`Imported ${result.imported} new, replaced ${result.replaced}`}
+                title={previewReady
+                  ? `Preview: ${result.imported} new, ${result.replaced} existing period${result.replaced === 1 ? "" : "s"}`
+                  : `Imported ${result.imported} new, replaced ${result.replaced}`}
               >
                 {result.errors.length === 0 ? (
-                  "Every row was accepted."
+                  previewReady ? "Review this result, then confirm to save the timetable." : "The validated rows were saved."
                 ) : (
                   <ul className="mt-1 flex flex-col gap-1">
                     {result.errors.map((message) => (

@@ -17,10 +17,10 @@ export interface NavItem {
 export function Wordmark({ compact = false }: { compact?: boolean }) {
   return (
     <span className="inline-flex items-center gap-2">
-      <span className="grid size-7 place-items-center rounded-[7px] bg-brand text-[13px] font-semibold text-white">
-        S
+      <span className="grid size-7 place-items-center rounded-[7px] bg-brand text-[11px] font-semibold text-white">
+        TE
       </span>
-      {!compact && <span className="text-sm font-semibold tracking-tight text-ink">Smart Attendance</span>}
+      {!compact && <span className="text-sm font-semibold tracking-tight text-ink">True Eye</span>}
     </span>
   );
 }

@@ -1,15 +1,14 @@
-# Byte-compiled / cache
+# Byte-compiled files and caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
-# App-internal metadata
+# Local metadata and editor scratch
 .freebuff/
-
-# Editor / debugging scratch (local only; not part of the project)
-.tempCodeRunnerFile.py
 .codebuff/
+.tempCodeRunnerFile.py
 
-# SQLite sidecar files (WAL/SHM) — attendance.db itself is tracked today,
-# but the transient journal files never belong in git.
+# Local attendance database and SQLite journals contain private records
+attendance.db
 *.db-wal
 *.db-shm

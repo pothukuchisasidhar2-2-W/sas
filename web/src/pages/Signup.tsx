@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
-import { MOCK_BRANCHES, MOCK_SECTIONS, MOCK_YEARS, errorMessage } from "../api/client";
+import { MOCK_BRANCHES, MOCK_SECTIONS, MOCK_YEARS, USING_MOCK, errorMessage } from "../api/client";
 import { Wordmark } from "../components/AppShell";
 import { Alert, Button, Card, Field, Input, Select, cx } from "../components/ui";
 import { useAuth } from "../lib/auth";
@@ -32,6 +32,7 @@ export default function Signup() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
 
   // Student fields
   const [studentId, setStudentId] = useState("");
@@ -73,13 +74,14 @@ export default function Signup() {
           year,
           section,
           studentId: studentId.trim(),
+          inviteCode: inviteCode.trim(),
         });
         // Students go straight to face enrolment — an account without an
         // embedding cannot be recognised by the camera.
         navigate(user.role === "student" ? "/student/enroll" : "/student", { replace: true });
       } else {
         const cleaned = assignments.filter((a) => a.subjectCode.trim());
-        if (cleaned.length === 0) {
+        if (USING_MOCK && cleaned.length === 0) {
           throw new Error("Add at least one class you are managing (subject code and section).");
         }
         const user = await signupTeacher({
@@ -92,6 +94,7 @@ export default function Signup() {
             subjectCode: a.subjectCode.trim().toUpperCase(),
             subjectName: a.subjectName.trim() || a.subjectCode.trim().toUpperCase(),
           })),
+          inviteCode: inviteCode.trim(),
         });
         navigate(user.role === "teacher" ? "/teacher" : "/", { replace: true });
       }
@@ -112,8 +115,7 @@ export default function Signup() {
         <Card className="p-6">
           <h1 className="text-lg font-semibold tracking-tight text-ink">Create your account</h1>
           <p className="mt-1 text-[13px] text-muted">
-            Pick what you are. Students are matched to their class by branch, year and section;
-            teachers are matched to the classes they manage.
+            True Eye accounts are linked to attendance records and class access by your institution.
           </p>
 
           {/* Role switch */}
@@ -174,6 +176,20 @@ export default function Signup() {
               />
             </Field>
 
+            <Field
+              label="Institution activation code"
+              required
+              hint="Ask an authorized department or attendance operator for your one-time code."
+            >
+              <Input
+                required
+                autoComplete="off"
+                value={inviteCode}
+                onChange={(event) => setInviteCode(event.target.value)}
+                placeholder="Paste your activation code"
+              />
+            </Field>
+
             {/* ------------------------------------------------ student block */}
             {role === "student" && (
               <>
@@ -191,7 +207,7 @@ export default function Signup() {
                       inputMode="numeric"
                     />
                   </Field>
-                  <Field label="Branch" required>
+                  {USING_MOCK && <Field label="Branch" required>
                     <Select value={branch} onChange={(event) => setBranch(event.target.value)}>
                       {MOCK_BRANCHES.map((option) => (
                         <option key={option} value={option}>
@@ -199,10 +215,10 @@ export default function Signup() {
                         </option>
                       ))}
                     </Select>
-                  </Field>
+                  </Field>}
                 </div>
 
-                <div className="grid gap-4 sm:grid-cols-2">
+                {USING_MOCK && <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="Year" required>
                     <Select
                       value={year}
@@ -224,21 +240,26 @@ export default function Signup() {
                       ))}
                     </Select>
                   </Field>
-                </div>
+                </div>}
 
-                <p className="rounded-field bg-canvas px-3.5 py-2.5 text-xs leading-relaxed text-muted">
+                {USING_MOCK && <p className="rounded-field bg-canvas px-3.5 py-2.5 text-xs leading-relaxed text-muted">
                   You will be registered as{" "}
                   <span className="font-medium text-ink">
                     {branch} · Year {year} · Section {section}
                   </span>
                   . Only attendance recorded for this class appears on your dashboard.
-                </p>
+                </p>}
               </>
             )}
 
             {/* ------------------------------------------------ teacher block */}
             {role === "teacher" && (
               <>
+                {!USING_MOCK && <Alert tone="info" title="Teacher access is institution controlled">
+                  Department membership and teaching assignments come from your activation code.
+                  You cannot grant yourself class access from this form.
+                </Alert>}
+                {USING_MOCK && <>
                 <Field
                   label="Department name"
                   hint="Shown on your profile. To actually join a department you either create one (becoming its HOD) or enter the code your HOD shared."
@@ -352,6 +373,7 @@ export default function Signup() {
                     ))}
                   </div>
                 </div>
+                </>}
               </>
             )}
 

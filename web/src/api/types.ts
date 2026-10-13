@@ -160,6 +160,15 @@ export interface DeptPost {
   relatedDate: string | null;
 }
 
+export interface DeptReply {
+  id: string;
+  postId: string;
+  authorUserId: string;
+  authorName: string;
+  body: string;
+  createdAt: string;
+}
+
 /* ---------------------------------------------------------------- reporting */
 
 export interface SubjectAttendanceSummary {

@@ -34,7 +34,10 @@ export default function TeacherDashboard() {
 
   const mySections = sections.data ?? [];
   const dayPeriods = periods.data ?? [];
-  const atRisk = (analytics.data ?? []).reduce((total, row) => total + row.atRiskCount, 0);
+  const riskRows = analytics.data ?? [];
+  const knownRiskRows = riskRows.filter((row) => row.atRiskCount !== null);
+  const atRisk = knownRiskRows.reduce((total, row) => total + (row.atRiskCount ?? 0), 0);
+  const riskIncomplete = knownRiskRows.length < riskRows.length;
 
   return (
     <PageBody>
@@ -90,9 +93,9 @@ export default function TeacherDashboard() {
           hint="Across those classes"
         />
         <StatTile
-          label="Below 75%"
-          value={analytics.loading ? "…" : atRisk}
-          hint="Student–subject pairs"
+          label="Below threshold"
+          value={analytics.loading ? "…" : riskIncomplete ? `${atRisk}+` : atRisk}
+          hint={riskIncomplete ? "More marks needed for a complete count" : "Student–subject pairs"}
           tone={atRisk > 0 ? "text-absent" : "text-present"}
         />
       </div>

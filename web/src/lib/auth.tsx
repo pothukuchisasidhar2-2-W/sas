@@ -21,7 +21,7 @@ import { api, setAuthToken } from "../api/client";
 import type { Session, SignupStudentInput, SignupTeacherInput } from "../api/contract";
 import type { SessionUser } from "../api/types";
 
-const TOKEN_KEY = "smart-attendance.token";
+const TOKEN_KEY = "true-eye.token";
 
 interface AuthContextValue {
   session: Session | null;

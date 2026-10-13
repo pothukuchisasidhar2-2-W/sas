@@ -101,6 +101,8 @@ export const api: Api = USING_MOCK
         request(`/api/timetable?sectionId=${encodeURIComponent(sectionId)}`),
       uploadTimetable: (_token, input) =>
         request("/api/teacher/timetable/upload", { method: "POST", body: JSON.stringify(input) }),
+      previewTimetable: (_token, input) =>
+        request("/api/teacher/timetable/preview", { method: "POST", body: JSON.stringify(input) }),
 
       myDepartment: () => request("/api/departments/mine"),
       createDepartment: (_token, name) =>
@@ -115,6 +117,13 @@ export const api: Api = USING_MOCK
           body: JSON.stringify({ permissions }),
         }),
       deptPosts: () => request("/api/departments/posts"),
+      deptReplies: (_token, postId) =>
+        request(`/api/departments/posts/${encodeURIComponent(postId)}/replies`),
+      createDeptReply: (_token, postId, body) =>
+        request(`/api/departments/posts/${encodeURIComponent(postId)}/replies`, {
+          method: "POST",
+          body: JSON.stringify({ body }),
+        }),
       createDeptPost: (_token, input) =>
         request("/api/departments/posts", { method: "POST", body: JSON.stringify(input) }),
       claimDeptPost: (_token, postId) =>
