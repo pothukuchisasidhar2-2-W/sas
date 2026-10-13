@@ -54,8 +54,9 @@ export default function StudentAttendance() {
   const from = addDaysIso(isoToday(), -(days - 1));
   const to = isoToday();
 
-  const records = useApiData([token, from, to], () => api.studentAttendance(token, from, to));
-  const timetable = useApiData([token, sectionId], () => api.sectionTimetable(token, sectionId));
+  const eligible = Boolean(student && student.enrollmentStatus !== "pending" && student.enrollmentStatus !== "rejected");
+  const records = useApiData([token, from, to, eligible], () => eligible ? api.studentAttendance(token, from, to) : Promise.resolve([]));
+  const timetable = useApiData([token, sectionId, eligible], () => eligible ? api.sectionTimetable(token, sectionId) : Promise.resolve([]));
 
   const slotById = useMemo(() => {
     const map = new Map<string, { startTime: string; endTime: string; room: string }>();
@@ -86,6 +87,15 @@ export default function StudentAttendance() {
   const percentage = denominator > 0 ? (counted / denominator) * 100 : null;
 
   if (!student) return null;
+
+  if (student.enrollmentStatus === "pending" || student.enrollmentStatus === "rejected") {
+    return (
+      <PageBody>
+        <PageHeader title="Attendance" description={student.sectionId} />
+        <Alert tone="warning">Attendance is available after a teacher approves your class membership.</Alert>
+      </PageBody>
+    );
+  }
 
   return (
     <PageBody>

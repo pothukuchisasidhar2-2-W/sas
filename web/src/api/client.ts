@@ -93,6 +93,11 @@ export const api: Api = USING_MOCK
         if (params.slotId) query.set("slotId", params.slotId);
         return request(`/api/teacher/roster?${query.toString()}`);
       },
+      reviewStudent: (_token, studentId, sectionId, status) =>
+        request(`/api/teacher/students/${encodeURIComponent(studentId)}/enrollment`, {
+          method: "PATCH",
+          body: JSON.stringify({ sectionId, status }),
+        }),
       markAttendance: (_token, input) =>
         request("/api/teacher/attendance", { method: "PATCH", body: JSON.stringify(input) }),
       teacherSchedule: (_token, date) =>

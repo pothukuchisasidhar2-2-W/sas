@@ -74,7 +74,6 @@ export default function Signup() {
           year,
           section,
           studentId: studentId.trim(),
-          inviteCode: inviteCode.trim(),
         });
         // Students go straight to face enrolment — an account without an
         // embedding cannot be recognised by the camera.
@@ -115,7 +114,7 @@ export default function Signup() {
         <Card className="p-6">
           <h1 className="text-lg font-semibold tracking-tight text-ink">Create your account</h1>
           <p className="mt-1 text-[13px] text-muted">
-            True Eye accounts are linked to attendance records and class access by your institution.
+            Students enter their class details and capture a face photo. A teacher reviews class membership.
           </p>
 
           {/* Role switch */}
@@ -176,7 +175,7 @@ export default function Signup() {
               />
             </Field>
 
-            <Field
+            {role === "teacher" && <Field
               label="Institution activation code"
               required
               hint="Ask an authorized department or attendance operator for your one-time code."
@@ -188,7 +187,7 @@ export default function Signup() {
                 onChange={(event) => setInviteCode(event.target.value)}
                 placeholder="Paste your activation code"
               />
-            </Field>
+            </Field>}
 
             {/* ------------------------------------------------ student block */}
             {role === "student" && (
@@ -216,6 +215,9 @@ export default function Signup() {
                       ))}
                     </Select>
                   </Field>}
+                  {!USING_MOCK && <Field label="Branch / programme" required>
+                    <Input required value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="CSE" />
+                  </Field>}
                 </div>
 
                 {USING_MOCK && <div className="grid gap-4 sm:grid-cols-2">
@@ -241,6 +243,19 @@ export default function Signup() {
                     </Select>
                   </Field>
                 </div>}
+
+                {!USING_MOCK && <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="Year" required>
+                    <Input required type="number" min={1} max={8} value={year} onChange={(event) => setYear(Number(event.target.value))} />
+                  </Field>
+                  <Field label="Class / section" required>
+                    <Input required value={section} onChange={(event) => setSection(event.target.value)} placeholder="A" />
+                  </Field>
+                </div>}
+
+                {!USING_MOCK && <p className="rounded-field bg-canvas px-3.5 py-2.5 text-xs leading-relaxed text-muted">
+                  Your class request starts as pending. A teacher responsible for this class will approve or reject it. You will capture your face after creating the account.
+                </p>}
 
                 {USING_MOCK && <p className="rounded-field bg-canvas px-3.5 py-2.5 text-xs leading-relaxed text-muted">
                   You will be registered as{" "}
@@ -380,7 +395,7 @@ export default function Signup() {
             {error && <Alert tone="error">{error}</Alert>}
 
             <Button type="submit" loading={busy} className="w-full">
-              {role === "student" ? "Continue to face enrolment" : "Create teacher account"}
+              {role === "student" ? "Create account and capture face" : "Create teacher account"}
             </Button>
           </form>
 

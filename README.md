@@ -13,8 +13,8 @@ tables remain in place. The API adds its own tables to that same database.
   enrollment endpoint.
 - `attendance.db`: shared local SQLite database. Never place it under `web/`.
 - `scripts/core/`: original webcam registration and recognition tools.
-- `scripts/admin/create_invite.py`: operator only command to issue activation
-  codes. Codes expire after seven days and can be redeemed once.
+- `scripts/admin/create_invite.py`: operator only command to issue teacher
+  activation codes. Codes expire after seven days and can be redeemed once.
 
 The web app does not read SQLite itself. Run the API and Vite development
 server on the same computer as the database and camera. The API can read legacy
@@ -54,20 +54,17 @@ starting Vite.
 
 ## Operator account setup
 
-An operator with local access creates one time activation codes. This command
-does not create an account or modify existing face records.
+Students self-register with their name, email, roll number, branch, year and
+section. The class request starts pending. The face capture screen sends one
+still image to the local API, which detects a face and stores its YuNet/SFace
+embedding in the existing `students` row. Existing face IDs are matched against
+the captured face before an account can reuse them. A teacher assigned to that
+class approves or rejects membership in **Teacher / Attendance monitoring**.
+Pending and rejected students cannot access attendance or be marked present.
 
-For a student, first ensure their attendance identity exists using the existing
-registration flow (`python scripts/core/register.py`), then issue a code:
-
-```powershell
-python scripts/admin/create_invite.py student
-```
-
-The operator enters the existing student ID and the student's class details,
-then shares the generated code directly with that student.
-
-For a teacher, issue a teacher invitation:
+Teacher accounts remain institution controlled. An operator with local access
+creates one-time activation codes for approved teacher assignments. To issue a
+teacher invitation:
 
 ```powershell
 python scripts/admin/create_invite.py teacher

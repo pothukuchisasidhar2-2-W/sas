@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
@@ -31,29 +32,85 @@ def invite(role, payload):
     return code
 
 
-def test_student_invite_links_only_its_existing_attendance_identity(client):
-    code = invite("student", {"studentId":"S100","branch":"CSE","year":2,"section":"A"})
+def test_student_self_signup_face_row_and_teacher_approval(client):
     response = client.post("/api/auth/signup/student", json={
         "name":"Test Student", "email":"student@example.test", "password":"long-password-123",
-        "branch":"CSE", "year":2, "section":"A", "studentId":"S100", "inviteCode":code,
+        "branch":"CSE", "year":2, "section":"A", "studentId":"S100",
     })
     assert response.status_code == 200
     token = response.json()["token"]
     assert response.json()["user"]["profile"]["studentId"] == "S100"
+    assert response.json()["user"]["profile"]["enrollmentStatus"] == "pending"
     assert "embedding" not in response.text
+    headers = {"Authorization":f"Bearer {token}"}
 
-    attendance = client.get("/api/student/attendance?from=2026-10-01&to=2026-10-31", headers={"Authorization":f"Bearer {token}"})
+    attendance = client.get("/api/student/attendance?from=2026-10-01&to=2026-10-31", headers=headers)
+    assert attendance.status_code == 403
+
+    teacher_code = invite("teacher", {"assignments":[{
+        "subjectCode":"CS201", "subjectName":"Systems", "branch":"CSE", "year":2, "section":"A"}]})
+    teacher = client.post("/api/auth/signup/teacher", json={
+        "name":"Test Teacher", "email":"reviewer@example.test", "password":"long-password-123",
+        "inviteCode":teacher_code,
+    })
+    teacher_headers = {"Authorization":f"Bearer {teacher.json()['token']}"}
+    roster = client.get("/api/teacher/roster?sectionId=CSE-2-A&date=2026-10-12", headers=teacher_headers)
+    assert next(row for row in roster.json() if row["studentId"] == "S100")["enrollmentStatus"] == "pending"
+
+    reject = client.patch("/api/teacher/students/S100/enrollment", headers=teacher_headers,
+        json={"sectionId":"CSE-2-A", "status":"rejected"})
+    assert reject.status_code == 200
+    assert client.get("/api/student/attendance?from=2026-10-01&to=2026-10-31", headers=headers).status_code == 403
+    approve = client.patch("/api/teacher/students/S100/enrollment", headers=teacher_headers,
+        json={"sectionId":"CSE-2-A", "status":"approved"})
+    assert approve.status_code == 200
+    assert client.get("/api/auth/me", headers=headers).json()["profile"]["enrollmentStatus"] == "approved"
+    attendance = client.get("/api/student/attendance?from=2026-10-01&to=2026-10-31", headers=headers)
     assert attendance.status_code == 200
     assert [row["studentId"] for row in attendance.json()] == ["S100"]
     assert attendance.json()[0]["subjectId"] == ""
+    removed = client.patch("/api/teacher/students/S100/enrollment", headers=teacher_headers,
+        json={"sectionId":"CSE-2-A", "status":"rejected"})
+    assert removed.status_code == 200
+    assert client.get("/api/student/attendance?from=2026-10-01&to=2026-10-31", headers=headers).status_code == 403
 
-    forbidden = client.get("/api/teacher/assignments", headers={"Authorization":f"Bearer {token}"})
+    forbidden = client.get("/api/teacher/assignments", headers=headers)
     assert forbidden.status_code == 403
-    reused = client.post("/api/auth/signup/student", json={
+    duplicate = client.post("/api/auth/signup/student", json={
         "name":"Another", "email":"another@example.test", "password":"long-password-123",
-        "branch":"CSE", "year":2, "section":"A", "studentId":"S100", "inviteCode":code,
+        "branch":"CSE", "year":2, "section":"A", "studentId":"S100",
     })
-    assert reused.status_code == 403
+    assert duplicate.status_code == 409
+
+
+def test_student_signup_creates_new_face_identity_and_class_from_form(client):
+    response = client.post("/api/auth/signup/student", json={
+        "name":"New Student", "email":"newstudent@example.test", "password":"long-password-123",
+        "branch":"ece", "year":1, "section":"b", "studentId":"S300",
+    })
+    assert response.status_code == 200
+    assert response.json()["user"]["profile"]["sectionId"] == "ECE-1-B"
+    assert response.json()["user"]["profile"]["faceEnrolled"] is False
+    with main.connect() as db:
+        row = db.execute("SELECT name,embedding FROM students WHERE student_id='S300'").fetchone()
+    assert row["name"] == "New Student"
+    assert row["embedding"] == b""
+
+
+def test_existing_profiles_migrate_as_approved(monkeypatch):
+    with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp_dir:
+        db_path = Path(temp_dir) / "legacy.db"
+        monkeypatch.setattr(main, "DB_PATH", db_path)
+        connection = sqlite3.connect(db_path)
+        with connection as db:
+            db.execute("CREATE TABLE student_profiles(user_id TEXT PRIMARY KEY, student_id TEXT, section_id TEXT, joined_at TEXT)")
+            db.execute("INSERT INTO student_profiles VALUES ('u1','S1','CSE-1-A','2025-01-01T00:00:00+00:00')")
+        connection.close()
+
+        main.init_db()
+        with main.connect() as db:
+            row = db.execute("SELECT enrollment_status FROM student_profiles WHERE user_id='u1'").fetchone()
+        assert row["enrollment_status"] == "approved"
 
 
 def test_teacher_scope_and_timetable_import_validation(client):

@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS sections (
 CREATE TABLE IF NOT EXISTS student_profiles (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   student_id TEXT NOT NULL UNIQUE REFERENCES students(student_id),
-  section_id TEXT NOT NULL REFERENCES sections(id), joined_at TEXT NOT NULL
+  section_id TEXT NOT NULL REFERENCES sections(id), joined_at TEXT NOT NULL,
+  enrollment_status TEXT NOT NULL DEFAULT 'approved' CHECK(enrollment_status IN ('pending','approved','rejected'))
 );
 CREATE TABLE IF NOT EXISTS teacher_profiles (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -144,6 +145,10 @@ def init_db() -> None:
     create_database(str(DB_PATH))
     with connect() as db:
         db.executescript(SCHEMA)
+        profile_columns = {row["name"] for row in db.execute("PRAGMA table_info(student_profiles)")}
+        if "enrollment_status" not in profile_columns:
+            # Existing profiles predate teacher review and retain access.
+            db.execute("ALTER TABLE student_profiles ADD COLUMN enrollment_status TEXT NOT NULL DEFAULT 'approved'")
         row = db.execute("SELECT version FROM true_eye_schema LIMIT 1").fetchone()
         if row is None:
             db.execute("INSERT INTO true_eye_schema(version) VALUES (1)")
@@ -188,7 +193,6 @@ class StudentSignup(LoginInput):
     year: int = Field(ge=1, le=8)
     section: str = Field(min_length=1, max_length=16)
     studentId: str = Field(min_length=1, max_length=64)
-    inviteCode: str = Field(min_length=16, max_length=128)
 
 
 class TeacherSignup(LoginInput):
@@ -279,7 +283,16 @@ def student_profile(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
     enrolled = db.execute("SELECT 1 FROM students WHERE student_id=? AND length(embedding)>0", (row["student_id"],)).fetchone() is not None
     return {"studentId": row["student_id"], "userId": row["user_id"], "name": row["name"], "email": row["email"],
             "branch": row["branch"], "year": row["year"], "section": row["section"], "sectionId": row["section_id"],
-            "faceEnrolled": enrolled, "harvestedReferences": embeddings, "joinedAt": row["joined_at"]}
+            "faceEnrolled": enrolled, "harvestedReferences": embeddings, "joinedAt": row["joined_at"],
+            "enrollmentStatus": row["enrollment_status"]}
+
+
+def require_approved_student(db: sqlite3.Connection, user: sqlite3.Row) -> None:
+    row = db.execute("SELECT enrollment_status FROM student_profiles WHERE user_id=?", (user["id"],)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Student profile is not available.")
+    if row["enrollment_status"] != "approved":
+        raise HTTPException(403, "Your class membership is awaiting teacher approval.")
 
 
 def teacher_profile(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
@@ -336,7 +349,7 @@ def login(body: LoginInput) -> dict[str, Any]:
 
 def signup_common(body: StudentSignup | TeacherSignup, role: str) -> dict[str, Any]:
     with connect() as db:
-        payload = consume_invite(db, body.inviteCode, role)
+        payload = consume_invite(db, body.inviteCode, role) if role == "teacher" else {}
         if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (body.email,)).fetchone():
             raise HTTPException(409, "An account already uses that email address.")
         user_id = uid()
@@ -344,16 +357,19 @@ def signup_common(body: StudentSignup | TeacherSignup, role: str) -> dict[str, A
                    (user_id, body.email.lower(), hash_secret(body.password), role, body.name.strip(), now_iso()))
         if role == "student":
             assert isinstance(body, StudentSignup)
-            sid = str(payload.get("studentId", ""))
-            identity = db.execute("SELECT name FROM students WHERE student_id=?", (sid,)).fetchone()
-            if not sid or body.studentId.strip() != sid or identity is None:
-                raise HTTPException(403, "This code is not linked to that registered attendance identity.")
-            branch = str(payload["branch"]).strip().upper()
-            year = int(payload["year"])
-            section = str(payload["section"]).strip().upper()
+            sid = body.studentId.strip()
+            if not sid:
+                raise HTTPException(422, "Enter your student or roll number.")
+            profile_exists = db.execute("SELECT 1 FROM student_profiles WHERE student_id=?", (sid,)).fetchone()
+            if profile_exists:
+                raise HTTPException(409, "That roll number already has a True Eye account.")
+            db.execute("INSERT OR IGNORE INTO students(student_id,name,embedding) VALUES (?,?,?)", (sid, body.name.strip(), b""))
+            branch = body.branch.strip().upper()
+            year = int(body.year)
+            section = body.section.strip().upper()
             section_id = f"{branch}-{year}-{section}"
             db.execute("INSERT OR IGNORE INTO sections(id,branch,year,section) VALUES (?,?,?,?)", (section_id, branch, year, section))
-            db.execute("INSERT INTO student_profiles(user_id,student_id,section_id,joined_at) VALUES (?,?,?,?)",
+            db.execute("INSERT INTO student_profiles(user_id,student_id,section_id,joined_at,enrollment_status) VALUES (?,?,?,?,'pending')",
                        (user_id, sid, section_id, now_iso()))
         else:
             db.execute("INSERT INTO teacher_profiles(user_id) VALUES (?)", (user_id,))
@@ -376,7 +392,8 @@ def signup_common(body: StudentSignup | TeacherSignup, role: str) -> dict[str, A
                 db.execute("INSERT OR IGNORE INTO sections(id,branch,year,section) VALUES (?,?,?,?)", (section_id, branch, year, section))
                 db.execute("INSERT INTO subjects(id,code,name,branch,year) VALUES (?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,branch=excluded.branch,year=excluded.year", (subject_id, code, name, branch, year))
                 db.execute("INSERT OR IGNORE INTO teaching_assignments(id,teacher_id,subject_id,section_id) VALUES (?,?,?,?)", (uid(), user_id, subject_id, section_id))
-        db.execute("UPDATE activation_invites SET used_at=? WHERE code_hash=?", (now_iso(), digest_token(body.inviteCode)))
+        if role == "teacher":
+            db.execute("UPDATE activation_invites SET used_at=? WHERE code_hash=?", (now_iso(), digest_token(body.inviteCode)))
         return make_session(db, user_id)
 
 
@@ -408,9 +425,9 @@ def section_obj(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def sections_for_teacher(db: sqlite3.Connection, teacher_id: str) -> list[dict[str, Any]]:
-    rows = db.execute("""SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id) strength
+    rows = db.execute("""SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id AND p.enrollment_status='approved') strength
       FROM sections s JOIN teaching_assignments a ON a.section_id=s.id WHERE a.teacher_id=?
-      UNION SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id) strength
+      UNION SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id AND p.enrollment_status='approved') strength
       FROM sections s JOIN department_members dm ON dm.user_id=? JOIN departments d ON d.id=dm.department_id
       JOIN teacher_profiles tp ON tp.user_id=? AND tp.department_id=d.id
       JOIN teaching_assignments a ON a.section_id=s.id
@@ -422,7 +439,7 @@ def sections_for_teacher(db: sqlite3.Connection, teacher_id: str) -> list[dict[s
 def directory_sections(user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any]]:
     with connect() as db:
         if user["role"] == "student":
-            rows = db.execute("SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id) strength FROM sections s JOIN student_profiles p ON p.section_id=s.id WHERE p.user_id=?", (user["id"],)).fetchall()
+            rows = db.execute("SELECT s.*, (SELECT COUNT(*) FROM student_profiles p WHERE p.section_id=s.id AND p.enrollment_status='approved') strength FROM sections s JOIN student_profiles p ON p.section_id=s.id WHERE p.user_id=?", (user["id"],)).fetchall()
         else:
             rows = sections_for_teacher(db, user["id"])
             return rows
@@ -478,6 +495,7 @@ def student_attendance(from_: str = __import__("fastapi").Query(default="", alia
         raise HTTPException(403, "Student access is required.")
     with connect() as db:
         p = student_profile(db, user)
+        require_approved_student(db, user)
         # Existing recognition rows have no subject/session assignment. Keep that explicit.
         q = "SELECT id,student_id,date,in_time,out_time FROM attendance WHERE student_id=?"
         args: list[Any] = [p["studentId"]]
@@ -503,6 +521,7 @@ def student_summary(user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any
         raise HTTPException(403, "Student access is required.")
     with connect() as db:
         p = student_profile(db, user)
+        require_approved_student(db, user)
         rows = db.execute("""SELECT s.id subject_id,s.code subject_code,s.name subject_name,
           COUNT(*) held_count,SUM(ca.status='present') present_count,SUM(ca.status='absent') absent_count,
           SUM(ca.status='late') late_count,SUM(ca.status='excused') excused_count
@@ -521,6 +540,7 @@ def student_schedule(date_: str = __import__("fastapi").Query(default="", alias=
     except ValueError as exc: raise HTTPException(422, "Date must use YYYY-MM-DD.") from exc
     with connect() as db:
         p = student_profile(db, user)
+        require_approved_student(db, user)
         slots = db.execute("""SELECT ts.*,su.code,su.name subject_name,su.branch,su.year,u.name teacher_name
           FROM timetable_slots ts JOIN subjects su ON su.id=ts.subject_id JOIN users u ON u.id=ts.teacher_id
           WHERE ts.section_id=? AND ts.day_of_week=? ORDER BY ts.start_time""", (p["sectionId"], target.isoweekday())).fetchall()
@@ -541,6 +561,7 @@ def teacher_assignments(user: sqlite3.Row = Depends(require_teacher)) -> list[di
 def timetable(sectionId: str, user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any]]:
     with connect() as db:
         if user["role"] == "student":
+            require_approved_student(db,user)
             if student_profile(db,user)["sectionId"] != sectionId: raise HTTPException(403,"You cannot view this class timetable.")
         else:
             require_assignment(db,user["id"],sectionId)
@@ -561,7 +582,7 @@ def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alia
     with connect() as db:
         require_assignment(db,user["id"],sectionId,slotId)
         if slotId and db.execute("SELECT 1 FROM timetable_slots WHERE id=? AND section_id=?",(slotId,sectionId)).fetchone() is None: raise HTTPException(404,"Period not found.")
-        students=db.execute("""SELECT s.student_id,s.name FROM student_profiles p JOIN students s ON s.student_id=p.student_id
+        students=db.execute("""SELECT s.student_id,s.name,p.enrollment_status FROM student_profiles p JOIN students s ON s.student_id=p.student_id
           WHERE p.section_id=? ORDER BY s.name""",(sectionId,)).fetchall()
         result=[]
         for student in students:
@@ -569,10 +590,26 @@ def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alia
             if slotId: q+=" AND slot_id=?";args.append(slotId)
             rows=db.execute(q+" ORDER BY in_time",args).fetchall()
             if not rows:
-                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None})
+                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None,"enrollmentStatus":student["enrollment_status"]})
             else:
-                for row in rows: result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"]})
+                for row in rows: result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"],"enrollmentStatus":student["enrollment_status"]})
         return result
+
+
+class StudentReviewInput(BaseModel):
+    sectionId: str
+    status: str = Field(pattern="^(approved|rejected)$")
+
+
+@app.patch("/api/teacher/students/{student_id}/enrollment")
+def review_student(student_id: str, body: StudentReviewInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, str]:
+    with connect() as db:
+        require_assignment(db, user["id"], body.sectionId)
+        cursor = db.execute("UPDATE student_profiles SET enrollment_status=? WHERE student_id=? AND section_id=?",
+                            (body.status, student_id, body.sectionId))
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Student class request was not found.")
+        return {"studentId": student_id, "enrollmentStatus": body.status}
 
 
 @app.patch("/api/teacher/attendance")
@@ -583,7 +620,9 @@ def mark_attendance(body: MarkInput, user: sqlite3.Row = Depends(require_teacher
         require_assignment(db,user["id"],body.sectionId,body.slotId)
         slot=db.execute("SELECT * FROM timetable_slots WHERE id=? AND section_id=?",(body.slotId,body.sectionId)).fetchone()
         if slot is None: raise HTTPException(404,"Period not found.")
-        if db.execute("SELECT 1 FROM student_profiles WHERE student_id=? AND section_id=?",(body.studentId,body.sectionId)).fetchone() is None: raise HTTPException(404,"Student is not in this class.")
+        student=db.execute("SELECT enrollment_status FROM student_profiles WHERE student_id=? AND section_id=?",(body.studentId,body.sectionId)).fetchone()
+        if student is None: raise HTTPException(404,"Student is not in this class.")
+        if student["enrollment_status"]!="approved": raise HTTPException(409,"Approve the student's class membership before marking attendance.")
         existing=db.execute("SELECT * FROM class_attendance WHERE student_id=? AND slot_id=? AND date=?",(body.studentId,body.slotId,body.date)).fetchone()
         row_id=existing["id"] if existing else uid()
         stamp=datetime.now().strftime("%H:%M:%S") if body.status in ("present","late") else None
@@ -840,17 +879,19 @@ def department_analytics(user: sqlite3.Row=Depends(require_teacher)) -> list[dic
           COUNT(DISTINCT ca.date||':'||ca.slot_id) sessions,COUNT(*) marked,
           SUM(ca.status IN ('present','late')) present
           FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id JOIN subjects su ON su.id=ts.subject_id
+          JOIN student_profiles sp ON sp.student_id=ca.student_id AND sp.enrollment_status='approved'
           JOIN teaching_assignments a ON a.section_id=ts.section_id JOIN teacher_profiles tp ON tp.department_id=? AND tp.user_id=a.teacher_id
           GROUP BY ts.section_id,su.id""",(dept["id"],)).fetchall()
         result=[]
         for r in rows:
-            strength=db.execute("SELECT COUNT(*) FROM student_profiles WHERE section_id=?",(r["section_id"],)).fetchone()[0]
+            strength=db.execute("SELECT COUNT(*) FROM student_profiles WHERE section_id=? AND enrollment_status='approved'",(r["section_id"],)).fetchone()[0]
             complete=bool(strength and r["sessions"] and r["marked"] >= strength*r["sessions"])
             at_risk=None
             if complete:
                 per_student=db.execute("""SELECT student_id,COUNT(*) held,
                   SUM(status IN ('present','late')) attended,SUM(status='excused') excused
                   FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id
+                  JOIN student_profiles sp ON sp.student_id=ca.student_id AND sp.enrollment_status='approved'
                   WHERE ts.section_id=? AND ts.subject_id=? GROUP BY student_id""",(r["section_id"],r["subject_id"])).fetchall()
                 at_risk=sum(1 for student in per_student if student["held"]>student["excused"] and
                   student["attended"]/(student["held"]-student["excused"]) < ATTENDANCE_THRESHOLD/100)
@@ -885,9 +926,16 @@ def enroll_face(body: dict[str,str],user: sqlite3.Row=Depends(get_user)) -> dict
     embedding=(embedding/norm).astype(np.float32).tobytes()
     with connect() as db:
         profile=student_profile(db,user)
-        existing=db.execute("SELECT length(embedding) size FROM students WHERE student_id=?",(profile["studentId"],)).fetchone()
+        existing=db.execute("SELECT embedding FROM students WHERE student_id=?",(profile["studentId"],)).fetchone()
         if existing is None: raise HTTPException(404,"No attendance identity is registered for this account.")
-        if existing["size"]: raise HTTPException(409,"Your face is already enrolled. Contact an authorized operator if it needs to be re-enrolled.")
+        if existing["embedding"]:
+            stored=np.frombuffer(existing["embedding"],dtype=np.float32)
+            captured=np.frombuffer(embedding,dtype=np.float32)
+            if stored.shape != captured.shape or not np.isfinite(stored).all():
+                raise HTTPException(409,"That roll number already has an incompatible face record. Contact your attendance operator.")
+            if float(np.dot(stored,captured)) < 0.363:
+                raise HTTPException(409,"The captured face does not match the face already registered to that roll number.")
+            return {"harvestedReferences":0}
         db.execute("UPDATE students SET embedding=? WHERE student_id=?",(embedding,profile["studentId"]))
         db.execute("DELETE FROM student_embeddings WHERE student_id=?",(profile["studentId"],))
         return {"harvestedReferences":0}

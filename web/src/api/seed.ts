@@ -288,6 +288,7 @@ export function createSeedDatabase(now = new Date()): SeedDatabase {
         faceEnrolled: i !== 5 && i !== 12,
         harvestedReferences: real ? real.harvested : hashString(studentId) % 5,
         joinedAt: toIsoDate(addDays(now, -200 + (i % 40))),
+        enrollmentStatus: "approved",
       };
       students.push(student);
       users.push({ id: userId, email, password: DEMO_PASSWORD, role: "student" });

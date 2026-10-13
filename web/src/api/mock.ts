@@ -313,6 +313,7 @@ export const mockApi: Api = {
 
       harvestedReferences: 0,
       joinedAt: toIsoDate(new Date()),
+      enrollmentStatus: "approved",
     };
     db.students.push(profile);
     persist();
@@ -526,6 +527,7 @@ export const mockApi: Api = {
             status: "unmarked",
             inTime: null,
             method: null,
+            enrollmentStatus: student.enrollmentStatus ?? "approved",
           };
         }
 
@@ -540,9 +542,19 @@ export const mockApi: Api = {
           status: best.status,
           inTime: best.inTime,
           method: best.method,
+          enrollmentStatus: student.enrollmentStatus ?? "approved",
         };
       })
       .sort((a, b) => a.studentId.localeCompare(b.studentId));
+  },
+
+  async reviewStudent(token, studentId, sectionId, status) {
+    await net();
+    assertSectionInScope(token, sectionId);
+    const student = db.students.find((item) => item.studentId === studentId && item.sectionId === sectionId);
+    if (!student) fail(404, "Student class request was not found.");
+    student.enrollmentStatus = status;
+    persist();
   },
 
   async markAttendance(token, input) {

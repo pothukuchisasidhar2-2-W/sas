@@ -50,10 +50,10 @@ export default function StudentEnroll() {
   return (
     <PageBody>
       <PageHeader
-        title={student.faceEnrolled ? "Re-enrol your face" : "Enrol your face"}
+        title={student.faceEnrolled ? "Check your enrolled face" : "Enrol your face"}
         description={
           student.faceEnrolled
-            ? "You already have a stored embedding. Capturing again replaces it and clears any extra views the camera had learned."
+            ? "A face is already registered to this roll number. Capturing again checks that the face matches the existing attendance identity."
             : "One clear photo is all the recogniser needs. It runs entirely on this network — the image is never stored, only the resulting numbers."
         }
         actions={<Badge tone={student.faceEnrolled ? "present" : "late"}>
@@ -106,8 +106,7 @@ export default function StudentEnroll() {
                 <KeyValue label="Class" value={student.sectionId} />
               </dl>
               <p className="mt-3 text-xs leading-relaxed text-muted">
-                Wrong details? Fix them in your profile before enrolling — attendance is keyed on
-                the roll number.
+                Wrong details? Contact the class teacher before approval. Attendance and face recognition are keyed to this roll number.
               </p>
             </CardBody>
           </Card>
@@ -116,7 +115,7 @@ export default function StudentEnroll() {
             <CardBody className="flex flex-col gap-3">
               {error && <Alert tone="error">{error}</Alert>}
               <Button onClick={submit} loading={busy} disabled={!image} className="w-full">
-                {student.faceEnrolled ? "Replace my embedding" : "Save my face"}
+                {student.faceEnrolled ? "Verify my face" : "Save my face"}
               </Button>
               <Button
                 variant="ghost"

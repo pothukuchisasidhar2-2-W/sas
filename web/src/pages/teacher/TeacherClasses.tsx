@@ -120,11 +120,25 @@ export default function TeacherClasses() {
     }
   };
 
+  const reviewStudent = async (studentId: string, status: "approved" | "rejected") => {
+    setBusyRow(studentId);
+    setActionError(null);
+    try {
+      await api.reviewStudent(token, studentId, sectionId, status);
+      roster.reload();
+      sections.reload();
+    } catch (cause) {
+      setActionError(errorMessage(cause));
+    } finally {
+      setBusyRow(null);
+    }
+  };
+
   return (
     <PageBody>
       <PageHeader
         title="Attendance monitoring"
-        description="You only ever see classes you are assigned to. Corrections made here are recorded as manual, not camera."
+        description="Review student requests for your classes and manage period attendance. Attendance corrections are recorded as manual, not camera."
         actions={
           <Button variant="secondary" size="sm" onClick={roster.reload} loading={roster.loading}>
             Refresh
@@ -249,10 +263,12 @@ export default function TeacherClasses() {
               <tr>
                 <Th>Roll</Th>
                 <Th>Name</Th>
+                <Th>Membership</Th>
                 <Th>Status</Th>
                 <Th>Marked</Th>
                 <Th align="right">In time</Th>
-                <Th align="right">{activeSlot ? "Correct to" : ""}</Th>
+                <Th align="right">Period mark</Th>
+                <Th align="right">Class review</Th>
               </tr>
             </thead>
             <tbody>
@@ -260,6 +276,11 @@ export default function TeacherClasses() {
                 <tr key={row.studentId} className="hover:bg-canvas">
                   <Td className="font-medium tabular-nums">{row.studentId}</Td>
                   <Td>{row.name}</Td>
+                  <Td>
+                    {row.enrollmentStatus === "pending" ? <Badge tone="late">Pending review</Badge>
+                      : row.enrollmentStatus === "rejected" ? <Badge tone="absent">Rejected</Badge>
+                      : <Badge tone="present">Approved</Badge>}
+                  </Td>
                   <Td>
                     <StatusBadge status={row.status} />
                   </Td>
@@ -276,7 +297,7 @@ export default function TeacherClasses() {
                     {row.inTime ?? "—"}
                   </Td>
                   <Td align="right">
-                    {activeSlot ? (
+                    {activeSlot && row.enrollmentStatus === "approved" ? (
                       <div className="flex justify-end gap-1">
                         {MARK_OPTIONS.map((status) => (
                           <button
@@ -299,6 +320,24 @@ export default function TeacherClasses() {
                       </div>
                     ) : (
                       <span className="text-faint">—</span>
+                    )}
+                  </Td>
+                  <Td align="right">
+                    {row.enrollmentStatus === "approved" ? (
+                      <Button size="sm" variant="ghost" disabled={busyRow === row.studentId} onClick={() => reviewStudent(row.studentId, "rejected")}>
+                        Remove from class
+                      </Button>
+                    ) : (
+                      <div className="flex justify-end gap-2">
+                        <Button size="sm" variant="secondary" disabled={busyRow === row.studentId} onClick={() => reviewStudent(row.studentId, "approved")}>
+                          Approve
+                        </Button>
+                        {row.enrollmentStatus === "pending" && (
+                          <Button size="sm" variant="ghost" disabled={busyRow === row.studentId} onClick={() => reviewStudent(row.studentId, "rejected")}>
+                            Reject
+                          </Button>
+                        )}
+                      </div>
                     )}
                   </Td>
                 </tr>

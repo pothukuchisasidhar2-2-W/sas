@@ -35,16 +35,33 @@ const ATTENDANCE_THRESHOLD = Number.isFinite(REQUESTED_THRESHOLD) && REQUESTED_T
   : ELIGIBILITY;
 
 export default function StudentDashboard() {
-  const { user } = useAuth();
+  const { user, refresh } = useAuth();
   const token = useToken();
   const [date, setDate] = useState(isoToday());
 
-  const summary = useApiData([token], () => api.studentSummary(token));
-  const recent = useApiData([token], () => api.studentAttendance(token, "0001-01-01", isoToday()));
-  const schedule = useApiData([token, date], () => api.studentSchedule(token, date));
+  const eligible = user?.role === "student" && user.profile.enrollmentStatus !== "pending" && user.profile.enrollmentStatus !== "rejected";
+  const summary = useApiData([token, eligible], () => eligible ? api.studentSummary(token) : Promise.resolve([]));
+  const recent = useApiData([token, eligible], () => eligible ? api.studentAttendance(token, "0001-01-01", isoToday()) : Promise.resolve([]));
+  const schedule = useApiData([token, date, eligible], () => eligible ? api.studentSchedule(token, date) : Promise.resolve([]));
 
   if (!user || user.role !== "student") return null;
   const student = user.profile;
+
+  if (student.enrollmentStatus === "pending" || student.enrollmentStatus === "rejected") {
+    return (
+      <PageBody>
+        <PageHeader title={`Hello, ${student.name.split(" ")[0]}`} description={student.sectionId} />
+        <Alert tone={student.enrollmentStatus === "pending" ? "warning" : "error"}
+          title={student.enrollmentStatus === "pending" ? "Waiting for teacher approval" : "Class request was declined"}>
+          {student.enrollmentStatus === "pending"
+            ? "Your face registration and class details were received. A teacher assigned to your class must approve your membership before attendance records are available."
+            : "A teacher declined your class request. Contact the teacher or correct your class details with your institution."}
+        </Alert>
+        <div className="mt-4"><Button variant="secondary" onClick={() => void refresh()}>Check approval status</Button></div>
+        {!student.faceEnrolled && <div className="mt-4"><Link to="/student/enroll"><Button>Capture face photo</Button></Link></div>}
+      </PageBody>
+    );
+  }
 
   const entries = schedule.data ?? [];
   const held = entries.filter((entry) => entry.status !== "unmarked");

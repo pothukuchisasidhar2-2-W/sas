@@ -82,6 +82,7 @@ export interface StudentProfile {
   /** Extra reference embeddings harvested by liv_recog.py (max 4). */
   harvestedReferences: number;
   joinedAt: string;
+  enrollmentStatus: "pending" | "approved" | "rejected";
 }
 
 export interface TeachingAssignment {
@@ -199,4 +200,5 @@ export interface ClassAttendanceRow {
   status: AttendanceStatus;
   inTime: string | null;
   method: AttendanceMethod | null;
+  enrollmentStatus: "pending" | "approved" | "rejected";
 }

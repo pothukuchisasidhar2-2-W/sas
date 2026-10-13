@@ -48,8 +48,6 @@ export interface SignupStudentInput {
   section: string;
   /** Becomes the primary key in the existing `students` table. */
   studentId: string;
-  /** One-time institutional activation code linked to this attendance identity. */
-  inviteCode: string;
 }
 
 export interface SignupTeacherInput {
@@ -139,6 +137,8 @@ export interface Api {
     token: string,
     params: { sectionId: string; date: string; slotId?: string },
   ): Promise<ClassAttendanceRow[]>;
+  /** PATCH /api/teacher/students/:studentId/enrollment */
+  reviewStudent(token: string, studentId: string, sectionId: string, status: "approved" | "rejected"): Promise<void>;
   /** PATCH /api/teacher/attendance */
   markAttendance(
     token: string,

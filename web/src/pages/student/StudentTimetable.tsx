@@ -29,7 +29,8 @@ export default function StudentTimetable() {
   const student = user?.role === "student" ? user.profile : null;
   const sectionId = student?.sectionId ?? "";
 
-  const timetable = useApiData([token, sectionId], () => api.sectionTimetable(token, sectionId));
+  const eligible = Boolean(student && student.enrollmentStatus !== "pending" && student.enrollmentStatus !== "rejected");
+  const timetable = useApiData([token, sectionId, eligible], () => eligible ? api.sectionTimetable(token, sectionId) : Promise.resolve([]));
 
   const slots = useMemo(() => timetable.data ?? [], [timetable.data]);
 
@@ -43,6 +44,15 @@ export default function StudentTimetable() {
   const todayDow = new Date(`${isoToday()}T00:00:00`).getDay();
 
   if (!student) return null;
+
+  if (!eligible) {
+    return (
+      <PageBody>
+        <PageHeader title="Weekly timetable" description={student.sectionId} />
+        <Alert tone="warning">Your timetable will be available after a teacher approves your class membership.</Alert>
+      </PageBody>
+    );
+  }
 
   return (
     <PageBody>
