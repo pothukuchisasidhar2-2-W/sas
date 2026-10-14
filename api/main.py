@@ -413,7 +413,15 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="True Eye API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("TRUE_EYE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","),
+    allow_origins=[origin.strip() for origin in os.environ.get(
+        "TRUE_EYE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",") if origin.strip()],
+    # Vite picks another port when 5173 is already occupied. Keep local
+    # development working without requiring an API restart for each port.
+    allow_origin_regex=os.environ.get(
+        "TRUE_EYE_CORS_ORIGIN_REGEX",
+        r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    ),
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],

@@ -47,7 +47,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try {
     response = await fetch(`${API_URL}${path}`, { ...init, headers });
   } catch {
-    throw new HttpError(0, "Cannot reach the server. Is the API running?");
+    const target = API_URL || "the frontend origin";
+    throw new HttpError(
+      0,
+      `Could not connect to the API at ${target}. Check VITE_API_URL, that the API is running, and that its CORS settings allow this page's origin.`,
+    );
   }
 
   if (response.status === 204) return undefined as T;
