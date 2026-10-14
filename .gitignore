@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
+venv/
+web/node_modules/
+web/dist/
 
 # Local metadata and editor scratch
 .freebuff/

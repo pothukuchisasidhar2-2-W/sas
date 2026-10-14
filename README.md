@@ -25,25 +25,28 @@ periods.
 
 ## Install and start
 
-Use the project virtual environment if available, then install Python
-dependencies:
+Install Python and Node.js first. From the repository root, run this once to
+create `.venv`, install the packages from `requirements.txt`, and install the
+frontend packages from `web/package-lock.json`:
 
 ```powershell
-python -m pip install -r requirements.txt
+python scripts/install_dependencies.py
 ```
 
-Start the API from the repository root:
+The installer works on Windows, macOS, and Linux. It requires `python` and
+`npm` to be available on `PATH`. To start the API from the repository root on
+Windows:
 
 ```powershell
-python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-In another terminal, configure the frontend and start Vite:
+On macOS or Linux, use `.venv/bin/python` in that command. In another terminal,
+start Vite:
 
 ```powershell
 Set-Location .\web
 Copy-Item .env.example .env.local
-npm ci
 npm run dev
 ```
 
