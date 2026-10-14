@@ -1,0 +1,325 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Attendance System</title>
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<aside class="sidebar">
+    <a class="brand" href="/">
+        <span class="brand-icon">◎</span>
+        <span>Smart Attendance</span>
+    </a>
+
+    <p class="nav-label">MAIN MENU</p>
+    <nav>
+        <a class="{{ 'active' if page == 'dashboard' else '' }}"
+           href="/">▦ <span>Dashboard</span></a>
+
+        <a class="{{ 'active' if page == 'register' else '' }}"
+           href="/register">♙ <span>Register Student</span></a>
+
+        <a class="{{ 'active' if page == 'recognition' else '' }}"
+           href="/recognition">◎ <span>Live Recognition</span></a>
+
+        <a class="{{ 'active' if page == 'attendance' else '' }}"
+           href="/attendance">▤ <span>View Attendance</span></a>
+
+        <a class="{{ 'active' if page == 'students' else '' }}"
+           href="/students">♧ <span>Manage Students</span></a>
+    </nav>
+
+    <div class="sidebar-footer">
+        <div class="footer-dot"></div>
+        <strong>Smart Attendance</strong>
+        <small>Face recognition system</small>
+    </div>
+</aside>
+
+<main class="main">
+    <header class="topbar">
+        <div>
+            <p class="eyebrow">SMART ATTENDANCE SYSTEM</p>
+            <h1>
+                {% if page == 'dashboard' %}Dashboard
+                {% elif page == 'register' %}Register Student
+                {% elif page == 'recognition' %}Live Recognition
+                {% elif page == 'attendance' %}Attendance Records
+                {% elif page == 'students' %}Manage Students
+                {% endif %}
+            </h1>
+            <p class="subtitle">Face recognition based attendance management</p>
+        </div>
+        <a class="home-link" href="/">← Dashboard</a>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="notice {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+
+    {% if page == 'dashboard' %}
+        <section class="welcome">
+            <div>
+                <p class="eyebrow">WELCOME BACK</p>
+                <h2>Attendance made smarter.</h2>
+                <p>Register students, recognize faces and manage records from one place.</p>
+            </div>
+            <div class="welcome-symbol">⌖</div>
+        </section>
+
+        <section class="stats">
+            <article class="stat-card">
+                <div class="stat-icon blue">♙</div>
+                <p>Total Students</p>
+                <h2>{{ total_students }}</h2>
+                <small>Registered in database</small>
+            </article>
+            <article class="stat-card">
+                <div class="stat-icon green">✓</div>
+                <p>Today's Attendance</p>
+                <h2>{{ today_count }}</h2>
+                <small>Records for {{ today }}</small>
+            </article>
+            <article class="stat-card">
+                <div class="stat-icon purple">▤</div>
+                <p>Database</p>
+                <h2 class="database-title">SQLite</h2>
+                <small>attendance.db</small>
+            </article>
+        </section>
+
+        <h2 class="section-title">Quick Actions</h2>
+        <section class="actions">
+            <a class="action-card" href="/register">
+                <div class="action-icon blue">♙</div>
+                <h3>Register Student</h3>
+                <p>Save a student ID, name and face embedding.</p>
+                <span class="action-link">Open registration →</span>
+            </a>
+            <a class="action-card" href="/recognition">
+                <div class="action-icon green">◎</div>
+                <h3>Live Recognition</h3>
+                <p>Start your existing webcam recognition program.</p>
+                <span class="action-link">Open recognition →</span>
+            </a>
+            <a class="action-card" href="/attendance">
+                <div class="action-icon purple">▤</div>
+                <h3>View Attendance</h3>
+                <p>Check saved attendance dates and IN/OUT times.</p>
+                <span class="action-link">View records →</span>
+            </a>
+        </section>
+
+        <section class="table-card">
+            <div class="table-heading">
+                <div>
+                    <h2>Recent Attendance</h2>
+                    <p>Latest records from your database</p>
+                </div>
+                <a class="small-link" href="/attendance">View all →</a>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Student ID</th><th>Name</th><th>Date</th>
+                            <th>IN Time</th><th>OUT Time</th><th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for record in recent_attendance %}
+                        <tr>
+                            <td>{{ record["student_id"] }}</td>
+                            <td>{{ record["name"] or "Unknown student" }}</td>
+                            <td>{{ record["date"] }}</td>
+                            <td>{{ record["in_time"] or "—" }}</td>
+                            <td>{{ record["out_time"] or "—" }}</td>
+                            <td>
+                                <span class="badge">
+                                    {{ "IN" if record["in_time"] else "—" }}
+                                </span>
+                            </td>
+                        </tr>
+                    {% else %}
+                        <tr><td colspan="6" class="empty">
+                            No attendance records yet.
+                        </td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    {% elif page == 'register' %}
+        <section class="content-card">
+            <div class="large-icon blue">♙</div>
+            <h2>Register a New Student</h2>
+            <p class="description">
+                Launch your existing registration program to capture a face
+                and save its embedding in the database.
+            </p>
+            <div class="info-panel">
+                <strong>Before you start</strong>
+                <ol>
+                    <li>Make sure your webcam is connected.</li>
+                    <li>Click the button below.</li>
+                    <li>A separate console window will ask for Student ID and name.</li>
+                    <li>Follow the instructions in the camera window and press Space or S.</li>
+                </ol>
+            </div>
+            <form method="post" action="/register">
+                <button class="primary-button" type="submit">
+                    Launch Student Registration →
+                </button>
+            </form>
+        </section>
+
+    {% elif page == 'recognition' %}
+        <section class="content-card">
+            <div class="large-icon green">◎</div>
+            <h2>Live Face Recognition</h2>
+            <p class="description">
+                Launch your existing recognition script. Recognized students
+                can have their IN attendance recorded in SQLite.
+            </p>
+            <div class="info-panel">
+                <strong>Before you start</strong>
+                <ol>
+                    <li>Register at least one student first.</li>
+                    <li>Ensure your webcam is available.</li>
+                    <li>Click Start Recognition below.</li>
+                    <li>Use Q or ESC in the camera window to exit if supported by your script.</li>
+                </ol>
+            </div>
+            <form method="post" action="/recognition">
+                <button class="primary-button green-button" type="submit">
+                    Start Live Recognition →
+                </button>
+            </form>
+        </section>
+
+    {% elif page == 'attendance' %}
+        <section class="table-card">
+            <div class="table-heading">
+                <div>
+                    <h2>All Attendance Records</h2>
+                    <p>Attendance data stored in attendance.db</p>
+                </div>
+                <span class="count-label">{{ records|length }} records</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Student ID</th><th>Name</th><th>Date</th>
+                            <th>IN Time</th><th>OUT Time</th><th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for record in records %}
+                        <tr>
+                            <td>{{ record["student_id"] }}</td>
+                            <td>{{ record["name"] or "Unknown student" }}</td>
+                            <td>{{ record["date"] }}</td>
+                            <td>{{ record["in_time"] or "—" }}</td>
+                            <td>{{ record["out_time"] or "—" }}</td>
+                            <td><span class="badge">
+                                {{ "IN" if record["in_time"] else "—" }}
+                            </span></td>
+                        </tr>
+                    {% else %}
+                        <tr><td colspan="6" class="empty">
+                            No attendance records found.
+                        </td></tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        
+    {% elif page == 'students' %}
+
+        <section class="table-card">
+            <div class="table-heading">
+                <div>
+                    <h2>Registered Students</h2>
+                    <p>Student details stored in Firebase Firestore</p>
+                </div>
+                <a class="small-link" href="/register">+ Register Student</a>
+            </div>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Student ID</th>
+                            <th>Student Name</th>
+                            <th>Face Data</th>
+                            <th>Edit Name</th>
+                            <th>Delete</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for student in students %}
+                        <tr>
+                            <td>{{ student.get("student_id", "") }}</td>
+                            <td>{{ student.get("name", "") }}</td>
+                            <td><span class="badge">Student record</span></td>
+
+                            <td>
+                                <form
+                                    method="post"
+                                    action="{{ url_for('edit_student', student_id=student.get('student_id', '')) }}"
+                                    style="display:flex; gap:6px; min-width:180px;"
+                                >
+                                    <input
+                                        type="text"
+                                        name="name"
+                                        value="{{ student.get('name', '') }}"
+                                        required
+                                        maxlength="100"
+                                        aria-label="New student name"
+                                    >
+                                    <button type="submit">Save</button>
+                                </form>
+                            </td>
+
+                            <td>
+                                <form
+                                    method="post"
+                                    action="{{ url_for('remove_student', student_id=student.get('student_id', '')) }}"
+                                    onsubmit="return confirm('Delete this student and their local face data? Attendance history will remain.');"
+                                >
+                                    <button type="submit">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                    {% else %}
+                        <tr>
+                            <td colspan="5" class="empty">
+                                No students found in Firebase yet.
+                            </td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    
+                    
+    {% endif %}
+
+    <footer>Smart Attendance System · Powered by Python, Flask and OpenCV</footer>
+</main>
+</body>
+</html>

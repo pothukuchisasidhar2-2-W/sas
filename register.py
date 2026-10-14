@@ -1,253 +1,225 @@
+
 import cv2
 import sqlite3
 import numpy as np
-import time
+from pathlib import Path
 
-YUNET_MODEL = "models/face_detection_yunet_2026may.onnx"
-SFACE_MODEL = "models/face_recognition_sface_2021dec.onnx"
-DB_PATH = "attendance.db"
+# ==========================================
+# CONFIGURATION
+# ==========================================
+BASE_DIR = Path(__file__).resolve().parent
 
-# -----------------------------
-# Student details
-# -----------------------------
-student_id = input("Enter Student ID: ").strip()
-name = input("Enter Student Name: ").strip()
-
-if not student_id or not name:
-    print("Student ID and Name are required.")
-    exit()
-
-# -----------------------------
-# Load models
-# -----------------------------
-detector = cv2.FaceDetectorYN.create(
-    YUNET_MODEL,
-    "",
-    (320, 320),
-    0.8,
-    0.3,
-    5000
+YUNET_MODEL = str(
+    BASE_DIR / "models" / "face_detection_yunet_2026may.onnx"
 )
-
-recognizer = cv2.FaceRecognizerSF.create(
-    SFACE_MODEL,
-    ""
+SFACE_MODEL = str(
+    BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
 )
+DB_PATH = str(BASE_DIR / "attendance.db")
 
-# -----------------------------
-# Open camera
-# -----------------------------
-camera = cv2.VideoCapture(0)
 
-if not camera.isOpened():
-    print("Camera could not open.")
-    exit()
+def main():
+    # Check model files
+    if not Path(YUNET_MODEL).is_file():
+        print("ERROR: YuNet model not found:", YUNET_MODEL)
+        return
 
-print()
-print("==============================")
-print("STUDENT REGISTRATION")
-print("==============================")
-print("Look directly at the camera.")
-print()
-print("Press S OR SPACEBAR to register.")
-print("Press Q to cancel.")
-print("==============================")
+    if not Path(SFACE_MODEL).is_file():
+        print("ERROR: SFace model not found:", SFACE_MODEL)
+        return
 
-face_detected = False
-selected_face = None
+    # Get student details
+    student_id = input("Enter Student ID: ").strip()
+    name = input("Enter Student Name: ").strip()
 
-while True:
+    if not student_id or not name:
+        print("Student ID and name are required.")
+        return
 
-    success, frame = camera.read()
-
-    if not success:
-        print("Could not read camera.")
-        break
-
-    height, width = frame.shape[:2]
-
-    detector.setInputSize((width, height))
-
-    _, faces = detector.detect(frame)
-
-    face_detected = False
-    selected_face = None
-
-    # -----------------------------
-    # Detect face
-    # -----------------------------
-    if faces is not None and len(faces) > 0:
-
-        # Select largest face
-        selected_face = max(
-            faces,
-            key=lambda f: f[2] * f[3]
-        )
-
-        x, y, w, h = map(
-            int,
-            selected_face[:4]
-        )
-
-        face_detected = True
-
-        # Red rectangle
-        cv2.rectangle(
-            frame,
-            (x, y),
-            (x + w, y + h),
-            (0, 0, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            "Face detected",
-            (x, max(y - 10, 25)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 0, 255),
-            2
-        )
-
-    else:
-
-        cv2.putText(
-            frame,
-            "No face detected",
-            (30, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2
-        )
-
-    # -----------------------------
-    # Instructions on screen
-    # -----------------------------
-    cv2.putText(
-        frame,
-        "Press S or SPACE to register",
-        (30, height - 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
+    # Load face detection model
+    detector = cv2.FaceDetectorYN.create(
+        YUNET_MODEL,
+        "",
+        (320, 320),
+        0.8,
+        0.3,
+        5000
     )
 
-    cv2.putText(
-        frame,
-        "Press Q to cancel",
-        (30, height - 20),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2
+    # Load face recognition model
+    recognizer = cv2.FaceRecognizerSF.create(
+        SFACE_MODEL,
+        ""
     )
 
-    # -----------------------------
-    # Show camera
-    # -----------------------------
-    cv2.imshow(
-        "Student Registration",
-        frame
-    )
+    # Open camera
+    camera = cv2.VideoCapture(0)
 
-    # -----------------------------
-    # Read keyboard
-    # -----------------------------
-    key = cv2.waitKey(1) & 0xFF
+    if not camera.isOpened():
+        print("ERROR: Could not open camera.")
+        return
 
-    # S key OR Spacebar
-    if key == ord("s") or key == ord("S") or key == 32:
+    window_name = "Student Registration"
 
-        if not face_detected:
-            print("No face detected. Look at the camera and try again.")
-            continue
+    print("\n================================")
+    print("STUDENT FACE REGISTRATION")
+    print("================================")
+    print("1. Look directly at the camera.")
+    print("2. Click inside the camera window.")
+    print("3. Press SPACE or S to register.")
+    print("4. Press Q or ESC to cancel.")
+    print("================================\n")
 
-        print()
-        print("Face captured!")
-        print("Generating face embedding...")
+    # Create and focus the camera window
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-        try:
+    embedding_to_save = None
 
-            aligned_face = recognizer.alignCrop(
+    try:
+        while True:
+            success, frame = camera.read()
+
+            if not success:
+                print("ERROR: Could not read camera.")
+                break
+
+            height, width = frame.shape[:2]
+            detector.setInputSize((width, height))
+
+            _, faces = detector.detect(frame)
+
+            selected_face = None
+
+            if faces is not None and len(faces) > 0:
+                # Use the largest detected face
+                selected_face = max(
+                    faces,
+                    key=lambda f: f[2] * f[3]
+                )
+
+                x, y, w, h = map(
+                    int, selected_face[:4]
+                )
+
+                cv2.rectangle(
+                    frame,
+                    (x, y),
+                    (x + w, y + h),
+                    (0, 0, 255),
+                    2
+                )
+
+                message = "Face detected - SPACE / S to save"
+                color = (0, 0, 255)
+
+            else:
+                message = "No face detected"
+                color = (0, 0, 255)
+
+            cv2.putText(
                 frame,
-                selected_face
+                message,
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                color,
+                2
             )
 
-            embedding = recognizer.feature(
-                aligned_face
+            cv2.putText(
+                frame,
+                "Q / ESC: Cancel",
+                (20, height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2
             )
 
-        except Exception as e:
+            cv2.imshow(window_name, frame)
 
-            print("Could not generate embedding.")
-            print("Error:", e)
-            continue
+            # waitKeyEx can capture extended keyboard codes.
+            # A longer wait also gives the window time to process events.
+            key = cv2.waitKeyEx(20)
 
-        if embedding is None:
-            print("Embedding generation failed.")
-            continue
+            # Normalize common key codes
+            if key != -1:
+                key_low = key & 0xFF
+            else:
+                key_low = -1
 
-        print(
-            "Embedding shape:",
-            embedding.shape
-        )
+            # SPACE, S, or s
+            if key_low in (32, ord("s"), ord("S")):
+                print("Capture key received.")
 
-        # -----------------------------
-        # Save embedding
-        # -----------------------------
-        embedding_bytes = (
-            embedding
-            .astype(np.float32)
-            .tobytes()
-        )
+                if selected_face is None:
+                    print("No face detected. Please try again.")
+                    continue
 
-        connection = sqlite3.connect(
-            DB_PATH
-        )
+                try:
+                    # Use the original frame and matching face data
+                    aligned_face = recognizer.alignCrop(
+                        frame,
+                        selected_face
+                    )
 
-        cursor = connection.cursor()
+                    embedding = recognizer.feature(
+                        aligned_face
+                    )
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO students
-            (student_id, name, embedding)
-            VALUES (?, ?, ?)
-            """,
-            (
-                student_id,
-                name,
-                embedding_bytes
+                    if embedding is None or embedding.size == 0:
+                        print("Could not generate embedding. Try again.")
+                        continue
+
+                    embedding = np.asarray(
+                        embedding,
+                        dtype=np.float32
+                    ).reshape(1, -1)
+
+                    embedding_to_save = embedding.tobytes()
+
+                    print("Face embedding generated successfully.")
+                    break
+
+                except cv2.error as error:
+                    print("Face processing failed:", error)
+                    print("Adjust your position and try again.")
+
+            # Q or ESC
+            elif key_low in (ord("q"), ord("Q"), 27):
+                print("Registration cancelled.")
+                return
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+    if embedding_to_save is None:
+        print("Registration was not completed.")
+        return
+
+    # Save the student's embedding
+    try:
+        with sqlite3.connect(DB_PATH) as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO students
+                (student_id, name, embedding)
+                VALUES (?, ?, ?)
+                """,
+                (student_id, name, embedding_to_save)
             )
-        )
 
-        connection.commit()
-        connection.close()
-
-        print()
-        print("==============================")
+        print("\n================================")
         print("REGISTRATION SUCCESSFUL")
-        print("==============================")
-        print("Student ID :", student_id)
-        print("Name       :", name)
-        print("Embedding  : Stored")
-        print("==============================")
+        print("Student ID:", student_id)
+        print("Name:", name)
+        print("Face embedding saved to attendance.db")
+        print("================================")
 
-        # Small delay so user can see success
-        time.sleep(2)
-
-        break
-
-    # -----------------------------
-    # Quit
-    # -----------------------------
-    if key == ord("q") or key == ord("Q"):
-
-        print("Registration cancelled.")
-        break
+    except sqlite3.Error as error:
+        print("Database error:", error)
 
 
-camera.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()

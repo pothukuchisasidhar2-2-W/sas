@@ -1,6 +1,9 @@
-import sqlite3
 
-DB_PATH = "attendance.db"
+import sqlite3
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "attendance.db"
 
 connection = sqlite3.connect(DB_PATH)
 cursor = connection.cursor()
@@ -26,4 +29,4 @@ CREATE TABLE IF NOT EXISTS attendance (
 connection.commit()
 connection.close()
 
-print("Database created successfully!")
+print(f"Database created successfully at: {DB_PATH}")
