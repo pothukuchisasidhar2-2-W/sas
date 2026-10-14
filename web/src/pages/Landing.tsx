@@ -11,8 +11,8 @@ const STEPS = [
   },
   {
     step: "02",
-    title: "The camera marks the period",
-    body: "During class the recogniser matches faces against every stored embedding. A confirmed match writes attendance for that subject and period. No roll call, no proxy signatures.",
+    title: "Teachers record each period",
+    body: "Teachers mark attendance against the scheduled class. When the session is complete, any remaining approved students are recorded absent. The existing camera recogniser still records date-only attendance and is not yet connected to class periods.",
   },
   {
     step: "03",
@@ -34,10 +34,11 @@ const ROLES = [
   {
     title: "Teachers & HODs",
     points: [
-      "See live attendance only for the classes you teach",
-      "Correct a mark when the camera missed someone",
+      "See attendance for assigned classes and, for HODs, department classes",
+      "Record and correct attendance for scheduled periods",
+      "Complete a session to record remaining students as absent",
       "Upload the timetable for your sections",
-      "Form a department with a join code, and decide who can do what",
+      "Optionally create or join a department to coordinate with colleagues",
     ],
   },
 ];
@@ -120,12 +121,14 @@ export default function Landing() {
         {/* Departments */}
         <section className="border-t border-line py-14">
           <div className="max-w-3xl">
-            <h2 className="text-lg font-semibold tracking-tight text-ink">Departments have a shape</h2>
+            <h2 className="text-lg font-semibold tracking-tight text-ink">
+              Department collaboration is optional
+            </h2>
             <p className="mt-3 text-[13px] leading-relaxed text-muted">
-              An HOD creates the department and gets a join code. Other teachers join with that code
-              — nothing else. The HOD can then see exactly what each member is allowed to do, and
-              the department gets a board for the things that actually need saying: a period that
-              needs covering, a timetable that moved, an attendance audit that is due.
+              Teachers can use their assigned classes, timetables and attendance tools without
+              joining a department. When colleagues want to coordinate, an HOD can create one and
+              invite teachers with a join code. Members can then share announcements, coordinate
+              timetable changes and review department-wide attendance.
             </p>
           </div>
         </section>

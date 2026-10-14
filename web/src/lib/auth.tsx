@@ -17,8 +17,8 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
-import { api, setAuthToken } from "../api/client";
-import type { Session, SignupStudentInput, SignupTeacherInput } from "../api/contract";
+import { api, loginWithGoogle, setAuthToken, signupStudentWithGoogle, signupTeacherWithGoogle } from "../api/client";
+import type { GoogleSignupStudentInput, GoogleSignupTeacherInput, Session, SignupStudentInput, SignupTeacherInput } from "../api/contract";
 import type { SessionUser } from "../api/types";
 
 const TOKEN_KEY = "true-eye.token";
@@ -29,8 +29,11 @@ interface AuthContextValue {
   /** True while the stored token is being validated on first paint. */
   initialising: boolean;
   login: (email: string, password: string) => Promise<SessionUser>;
+  loginGoogle: (credential: string, nonce: string) => Promise<SessionUser>;
   signupStudent: (input: SignupStudentInput) => Promise<SessionUser>;
   signupTeacher: (input: SignupTeacherInput) => Promise<SessionUser>;
+  signupStudentGoogle: (input: GoogleSignupStudentInput) => Promise<SessionUser>;
+  signupTeacherGoogle: (input: GoogleSignupTeacherInput) => Promise<SessionUser>;
   logout: () => Promise<void>;
   /** Re-read the signed-in profile after something changed it. */
   refresh: () => Promise<void>;
@@ -71,6 +74,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [persist],
   );
 
+  const loginGoogle = useCallback(
+    async (credential: string, nonce: string) => persist(await loginWithGoogle(credential, nonce)),
+    [persist],
+  );
+
   const signupStudent = useCallback(
     async (input: SignupStudentInput) => persist(await api.signupStudent(input)),
     [persist],
@@ -78,6 +86,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signupTeacher = useCallback(
     async (input: SignupTeacherInput) => persist(await api.signupTeacher(input)),
+    [persist],
+  );
+
+  const signupStudentGoogle = useCallback(
+    async (input: GoogleSignupStudentInput) => persist(await signupStudentWithGoogle(input)),
+    [persist],
+  );
+
+  const signupTeacherGoogle = useCallback(
+    async (input: GoogleSignupTeacherInput) => persist(await signupTeacherWithGoogle(input)),
     [persist],
   );
 
@@ -107,12 +125,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user: session?.user ?? null,
       initialising,
       login,
+      loginGoogle,
       signupStudent,
       signupTeacher,
+      signupStudentGoogle,
+      signupTeacherGoogle,
       logout,
       refresh,
     }),
-    [session, initialising, login, signupStudent, signupTeacher, logout, refresh],
+    [session, initialising, login, loginGoogle, signupStudent, signupTeacher, signupStudentGoogle, signupTeacherGoogle, logout, refresh],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -23,11 +23,14 @@ export default function TeacherDashboard() {
   const { user } = useAuth();
   const token = useToken();
   const [date, setDate] = useState(isoToday());
+  const hasDepartment = user?.role === "teacher" && Boolean(user.profile.departmentId);
 
   const sections = useApiData([token], () => api.teacherSections(token));
   const periods = useApiData([token, date], () => api.teacherSchedule(token, date));
   const department = useApiData([token], () => api.myDepartment(token));
-  const analytics = useApiData([token], () => api.deptAnalytics(token));
+  const analytics = useApiData([token, hasDepartment], () =>
+    hasDepartment ? api.deptAnalytics(token) : Promise.resolve([]),
+  );
 
   if (!user || user.role !== "teacher") return null;
   const teacher = user.profile;
@@ -58,16 +61,17 @@ export default function TeacherDashboard() {
         <div className="pb-5">
           <Alert
             tone="info"
-            title="You are not in a department yet"
+            title="Department collaboration is optional"
             action={
               <Link to="/teacher/department">
                 <Button size="sm" variant="secondary">
-                  Set it up
+                  Explore departments
                 </Button>
               </Link>
             }
           >
-            Create a department to become its HOD, or join one with the code your HOD shared.
+            Your assigned classes and attendance tools work without a department. Create one to
+            coordinate with colleagues, or join with a code from your HOD.
           </Alert>
         </div>
       )}
@@ -94,8 +98,22 @@ export default function TeacherDashboard() {
         />
         <StatTile
           label="Below threshold"
-          value={analytics.loading ? "…" : riskIncomplete ? `${atRisk}+` : atRisk}
-          hint={riskIncomplete ? "More marks needed for a complete count" : "Student–subject pairs"}
+          value={
+            !hasDepartment
+              ? "—"
+              : analytics.loading
+                ? "…"
+                : riskIncomplete
+                  ? `${atRisk}+`
+                  : atRisk
+          }
+          hint={
+            !hasDepartment
+              ? "Department analytics"
+              : riskIncomplete
+                ? "More marks needed for a complete count"
+                : "Student–subject pairs"
+          }
           tone={atRisk > 0 ? "text-absent" : "text-present"}
         />
       </div>
@@ -110,7 +128,7 @@ export default function TeacherDashboard() {
             title={date === isoToday() ? "Your periods today" : `Periods on ${formatLongDate(date)}`}
             description={
               teacher.isHod
-                ? "Every period your department runs on this day."
+                ? "Department periods for monitoring. Attendance changes are limited to your own assigned periods."
                 : "Only the classes you are assigned to."
             }
             action={
@@ -146,6 +164,11 @@ export default function TeacherDashboard() {
                         {PERIOD_LABEL(slot.startTime, slot.endTime)}
                       </p>
                       <p className="mt-0.5 text-[11px] text-faint">{slot.room}</p>
+                      {slot.dateChange && (
+                        <Badge tone={slot.dateChange === "added" ? "brand" : "late"}>
+                          {slot.dateChange === "added" ? "Extra period" : "Changed"}
+                        </Badge>
+                      )}
                     </div>
                     <div className="min-w-0">
                       <p className="truncate text-[13px] font-medium text-ink">{slot.subjectId}</p>
@@ -175,7 +198,11 @@ export default function TeacherDashboard() {
             ) : mySections.length === 0 ? (
               <EmptyState
                 title="No classes assigned"
-                description="Ask your HOD to add you to a section, or re-register with the class you manage."
+                description={
+                  teacher.departmentId
+                    ? "Ask your HOD to add you to a section or update your teaching assignments."
+                    : "Ask your institution's attendance operator to check the class assignments on your teacher activation code."
+                }
               />
             ) : (
               <ul className="divide-y divide-line">

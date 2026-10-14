@@ -55,7 +55,7 @@ export default function StudentDashboard() {
           title={student.enrollmentStatus === "pending" ? "Waiting for teacher approval" : "Class request was declined"}>
           {student.enrollmentStatus === "pending"
             ? "Your face registration and class details were received. A teacher assigned to your class must approve your membership before attendance records are available."
-            : "A teacher declined your class request. Contact the teacher or correct your class details with your institution."}
+            : "A teacher declined your class request. Contact the teacher or correct your class details with the SAHE attendance administrator."}
         </Alert>
         <div className="mt-4"><Button variant="secondary" onClick={() => void refresh()}>Check approval status</Button></div>
         {!student.faceEnrolled && <div className="mt-4"><Link to="/student/enroll"><Button>Capture face photo</Button></Link></div>}
@@ -172,6 +172,11 @@ export default function StudentDashboard() {
                         {PERIOD_LABEL(entry.slot.startTime, entry.slot.endTime)}
                       </p>
                       <p className="mt-0.5 text-[11px] text-faint">{entry.slot.room}</p>
+                      {entry.slot.dateChange && (
+                        <Badge tone={entry.slot.dateChange === "added" ? "brand" : "late"}>
+                          {entry.slot.dateChange === "added" ? "Extra period" : "Changed"}
+                        </Badge>
+                      )}
                     </div>
                     <div className="min-w-0">
                       <p className="truncate text-[13px] font-medium text-ink">
@@ -202,7 +207,7 @@ export default function StudentDashboard() {
             <StatTile
               label="Overall"
               value={formatPercentage(overall)}
-              hint={totals.held ? `${totals.attended} of ${totals.held} marked class periods` : "No subject-linked class records yet"}
+              hint={totals.held ? `${totals.attended} of ${totals.held} completed class periods` : "No completed subject-linked sessions yet"}
               tone={overallTone.text}
             />
             <StatTile
@@ -215,7 +220,7 @@ export default function StudentDashboard() {
 
           {belowEligibility.length > 0 && (
             <Alert tone="warning" title={`${belowEligibility.length} subject${belowEligibility.length === 1 ? "" : "s"} below ${ATTENDANCE_THRESHOLD}%`}>
-              Attendance is compared with the institution threshold configured for this deployment.
+              Attendance is compared with the threshold configured for SAHE.
             </Alert>
           )}
 
@@ -286,7 +291,7 @@ export default function StudentDashboard() {
             )}
             <div className="border-t border-line px-5 py-3">
               <p className="text-[11px] text-faint">
-                The tick marks the configured {ATTENDANCE_THRESHOLD}% threshold. Class percentages only include periods explicitly marked in True Eye.
+                The tick marks the configured {ATTENDANCE_THRESHOLD}% threshold. Class percentages only include periods explicitly marked in SAHE Attendance.
               </p>
             </div>
           </Card>

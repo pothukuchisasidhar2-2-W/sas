@@ -16,11 +16,9 @@ export interface NavItem {
 
 export function Wordmark({ compact = false }: { compact?: boolean }) {
   return (
-    <span className="inline-flex items-center gap-2">
-      <span className="grid size-7 place-items-center rounded-[7px] bg-brand text-[11px] font-semibold text-white">
-        TE
-      </span>
-      {!compact && <span className="text-sm font-semibold tracking-tight text-ink">True Eye</span>}
+    <span className="inline-flex items-center gap-2.5">
+      <img src="/sahe-logo.webp" alt="SAHE logo" className="h-10 w-9 shrink-0 object-contain" />
+      {!compact && <span className="text-sm font-semibold tracking-tight text-ink">SAHE Attendance</span>}
     </span>
   );
 }

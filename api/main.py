@@ -12,6 +12,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -36,6 +37,8 @@ MODEL_RECOGNIZE = ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 SESSION_DAYS = 30
 OTP_MINUTES = 10
 ATTENDANCE_THRESHOLD = float(os.environ.get("TRUE_EYE_ATTENDANCE_THRESHOLD", "75"))
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+SAHE_INSTITUTION_NAME = "Siddhartha Academy of Higher Education"
 
 
 @contextmanager
@@ -59,7 +62,8 @@ CREATE TABLE IF NOT EXISTS true_eye_schema (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('student','teacher')),
-  name TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+  name TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  google_sub TEXT, college_name TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS api_sessions (
   token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -70,6 +74,9 @@ CREATE TABLE IF NOT EXISTS email_codes (
   email TEXT NOT NULL COLLATE NOCASE, purpose TEXT NOT NULL CHECK(purpose IN ('signup','reset')),
   code_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(email,purpose)
+);
+CREATE TABLE IF NOT EXISTS google_login_nonces (
+  nonce_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS activation_invites (
   code_hash TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('student','teacher')),
@@ -109,6 +116,16 @@ CREATE TABLE IF NOT EXISTS timetable_slots (
   CHECK(start_time < end_time)
 );
 CREATE INDEX IF NOT EXISTS idx_slots_teacher_day ON timetable_slots(teacher_id,day_of_week);
+CREATE TABLE IF NOT EXISTS timetable_exceptions (
+  id TEXT PRIMARY KEY, date TEXT NOT NULL, section_id TEXT NOT NULL REFERENCES sections(id),
+  slot_id TEXT NOT NULL REFERENCES timetable_slots(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('cancel','modify','add')),
+  start_time TEXT, end_time TEXT, room TEXT,
+  cancelled INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+  UNIQUE(date,slot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_timetable_exceptions_date ON timetable_exceptions(date,section_id);
 CREATE TABLE IF NOT EXISTS class_attendance (
   id TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES students(student_id),
   slot_id TEXT NOT NULL REFERENCES timetable_slots(id), date TEXT NOT NULL,
@@ -116,6 +133,34 @@ CREATE TABLE IF NOT EXISTS class_attendance (
   in_time TEXT, out_time TEXT, method TEXT NOT NULL CHECK(method IN ('face','manual')),
   marked_by TEXT REFERENCES users(id), created_at TEXT NOT NULL,
   UNIQUE(student_id,slot_id,date)
+);
+CREATE TABLE IF NOT EXISTS attendance_sessions (
+  id TEXT PRIMARY KEY, section_id TEXT NOT NULL REFERENCES sections(id),
+  slot_id TEXT NOT NULL REFERENCES timetable_slots(id), date TEXT NOT NULL,
+  completed_by TEXT NOT NULL REFERENCES users(id), completed_at TEXT NOT NULL,
+  UNIQUE(slot_id,date)
+);
+CREATE TABLE IF NOT EXISTS camera_runs (
+  camera_id TEXT NOT NULL, event_type TEXT NOT NULL CHECK(event_type IN ('entry','exit')),
+  section_id TEXT NOT NULL REFERENCES sections(id), slot_id TEXT NOT NULL REFERENCES timetable_slots(id),
+  date TEXT NOT NULL, started_at TEXT NOT NULL, last_heartbeat_at TEXT NOT NULL,
+  heartbeat_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(camera_id,event_type,slot_id,date)
+);
+CREATE TABLE IF NOT EXISTS camera_attendance_events (
+  id TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES students(student_id),
+  slot_id TEXT NOT NULL REFERENCES timetable_slots(id), date TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK(event_type IN ('entry','exit')),
+  camera_id TEXT NOT NULL, observed_at TEXT NOT NULL, score REAL NOT NULL,
+  UNIQUE(student_id,slot_id,date,event_type,camera_id)
+);
+CREATE INDEX IF NOT EXISTS idx_camera_events_period ON camera_attendance_events(slot_id,date);
+CREATE TABLE IF NOT EXISTS camera_attendance_reviews (
+  student_id TEXT NOT NULL REFERENCES students(student_id),
+  slot_id TEXT NOT NULL REFERENCES timetable_slots(id), date TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK(reason IN ('early_exit','not_observed')),
+  flagged_at TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT REFERENCES users(id),
+  PRIMARY KEY(student_id,slot_id,date)
 );
 CREATE TABLE IF NOT EXISTS departments (
   id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -154,10 +199,30 @@ def init_db() -> None:
     create_database(str(DB_PATH))
     with connect() as db:
         db.executescript(SCHEMA)
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "google_sub" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        if "college_name" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN college_name TEXT NOT NULL DEFAULT ''")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL")
         profile_columns = {row["name"] for row in db.execute("PRAGMA table_info(student_profiles)")}
         if "enrollment_status" not in profile_columns:
             # Existing profiles predate teacher review and retain access.
             db.execute("ALTER TABLE student_profiles ADD COLUMN enrollment_status TEXT NOT NULL DEFAULT 'approved'")
+        exception_columns = {row["name"] for row in db.execute("PRAGMA table_info(timetable_exceptions)")}
+        if "cancelled" not in exception_columns:
+            db.execute("ALTER TABLE timetable_exceptions ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0")
+        db.execute("""INSERT OR IGNORE INTO attendance_sessions
+            (id,section_id,slot_id,date,completed_by,completed_at)
+            SELECT lower(hex(randomblob(16))),ts.section_id,ca.slot_id,ca.date,ts.teacher_id,MAX(ca.created_at)
+            FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id
+            JOIN student_profiles sp ON sp.student_id=ca.student_id
+              AND sp.section_id=ts.section_id AND sp.enrollment_status='approved'
+            GROUP BY ts.section_id,ca.slot_id,ca.date
+            HAVING COUNT(DISTINCT ca.student_id)>0 AND COUNT(DISTINCT ca.student_id)=(
+              SELECT COUNT(*) FROM student_profiles approved
+              WHERE approved.section_id=ts.section_id AND approved.enrollment_status='approved'
+            )""")
         row = db.execute("SELECT version FROM true_eye_schema LIMIT 1").fetchone()
         if row is None:
             db.execute("INSERT INTO true_eye_schema(version) VALUES (1)")
@@ -191,6 +256,47 @@ def digest_token(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def verify_google_credential(credential: str, nonce: str) -> dict[str, str]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in is not configured on the API server.")
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2 import id_token as google_id_token
+
+        claims = google_id_token.verify_oauth2_token(
+            credential, GoogleAuthRequest(), GOOGLE_CLIENT_ID,
+        )
+    except ImportError:
+        raise HTTPException(503, "Install API requirements to enable Google sign-in.")
+    except ValueError:
+        raise HTTPException(401, "Google sign-in could not be verified. Try again.")
+    except Exception:
+        raise HTTPException(502, "Google sign-in verification is temporarily unavailable.")
+    if claims.get("nonce") != nonce:
+        raise HTTPException(401, "Google sign-in expired. Try again.")
+    with connect() as db:
+        valid_nonce = db.execute("SELECT 1 FROM google_login_nonces WHERE nonce_hash=? AND expires_at>?",
+                                 (digest_token(nonce), now_iso())).fetchone()
+    if valid_nonce is None:
+        raise HTTPException(401, "Google sign-in expired. Try again.")
+    if not claims.get("email_verified"):
+        raise HTTPException(403, "Use a Google account with a verified email address.")
+    subject = str(claims.get("sub", "")).strip()
+    email = str(claims.get("email", "")).strip().lower()
+    name = str(claims.get("name", "")).strip()[:120]
+    if not subject or "@" not in email or not name:
+        raise HTTPException(401, "Google did not provide the required verified account details.")
+    return {"sub": subject, "email": email, "name": name}
+
+
+def consume_google_nonce(nonce: str) -> None:
+    with connect() as db:
+        changed = db.execute("DELETE FROM google_login_nonces WHERE nonce_hash=? AND expires_at>?",
+                             (digest_token(nonce), now_iso())).rowcount
+        if changed != 1:
+            raise HTTPException(401, "Google sign-in expired or was already used. Try again.")
+
+
 class LoginInput(BaseModel):
     email: str = Field(min_length=3, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     password: str = Field(min_length=8, max_length=256)
@@ -220,6 +326,28 @@ class TeacherSignup(LoginInput):
     departmentName: str = Field(default="", max_length=100)
     inviteCode: str = Field(min_length=16, max_length=128)
     assignments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class GoogleCredentialInput(BaseModel):
+    credential: str = Field(min_length=32, max_length=8192)
+    nonce: str = Field(min_length=16, max_length=128)
+
+
+class GoogleStudentSignup(GoogleCredentialInput):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=256)
+    branch: str = Field(min_length=1, max_length=32)
+    year: int = Field(ge=1, le=8)
+    section: str = Field(min_length=1, max_length=16)
+    studentId: str = Field(min_length=1, max_length=64)
+
+
+class GoogleTeacherSignup(GoogleCredentialInput):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=256)
+    inviteCode: str = Field(min_length=16, max_length=128)
 
 
 class DepartmentInput(BaseModel):
@@ -254,9 +382,26 @@ class MarkInput(BaseModel):
     sectionId: str
 
 
+class CompleteAttendanceInput(BaseModel):
+    sectionId: str
+    slotId: str
+    date: str
+
+
 class TimetableInput(BaseModel):
     sectionId: str
     csv: str = Field(min_length=1, max_length=1_000_000)
+
+
+class TimetableChangeInput(BaseModel):
+    date: str
+    sectionId: str
+    kind: str = Field(pattern="^(cancel|modify|add)$")
+    slotId: str | None = None
+    subjectId: str | None = None
+    startTime: str | None = None
+    endTime: str | None = None
+    room: str | None = Field(default=None, max_length=100)
 
 
 @asynccontextmanager
@@ -294,14 +439,14 @@ def require_teacher(user: sqlite3.Row = Depends(get_user)) -> sqlite3.Row:
 
 
 def student_profile(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
-    row = db.execute("""SELECT sp.*,s.branch,s.year,s.section,s.id section_id,u.name,u.email
+    row = db.execute("""SELECT sp.*,s.branch,s.year,s.section,s.id section_id,u.name,u.email,u.college_name
       FROM student_profiles sp JOIN sections s ON s.id=sp.section_id
       JOIN users u ON u.id=sp.user_id WHERE sp.user_id=?""", (user["id"],)).fetchone()
     if row is None:
         raise HTTPException(404, "Student profile is not available.")
     embeddings = db.execute("SELECT COUNT(*) FROM student_embeddings WHERE student_id=?", (row["student_id"],)).fetchone()[0]
     enrolled = db.execute("SELECT 1 FROM students WHERE student_id=? AND length(embedding)>0", (row["student_id"],)).fetchone() is not None
-    return {"studentId": row["student_id"], "userId": row["user_id"], "name": row["name"], "email": row["email"],
+    return {"studentId": row["student_id"], "userId": row["user_id"], "name": row["name"], "email": row["email"], "collegeName": row["college_name"],
             "branch": row["branch"], "year": row["year"], "section": row["section"], "sectionId": row["section_id"],
             "faceEnrolled": enrolled, "harvestedReferences": embeddings, "joinedAt": row["joined_at"],
             "enrollmentStatus": row["enrollment_status"]}
@@ -316,8 +461,8 @@ def require_approved_student(db: sqlite3.Connection, user: sqlite3.Row) -> None:
 
 
 def teacher_profile(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
-    profile = db.execute("""SELECT tp.department_id,d.name department_name FROM teacher_profiles tp
-      LEFT JOIN departments d ON d.id=tp.department_id WHERE tp.user_id=?""", (user["id"],)).fetchone()
+    profile = db.execute("""SELECT tp.department_id,d.name department_name,u.college_name FROM teacher_profiles tp
+      JOIN users u ON u.id=tp.user_id LEFT JOIN departments d ON d.id=tp.department_id WHERE tp.user_id=?""", (user["id"],)).fetchone()
     rows = db.execute("""SELECT a.id assignment_id, su.id subject_id,su.code,su.name subject_name,
       su.branch,su.year,se.id section_id,se.section,a.periods_per_week
       FROM teaching_assignments a JOIN subjects su ON su.id=a.subject_id
@@ -328,7 +473,8 @@ def teacher_profile(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]
       "section": r["section"], "periodsPerWeek": r["periods_per_week"]} for r in rows]
     return {"userId": user["id"], "name": user["name"], "email": user["email"],
       "departmentId": profile["department_id"] if profile else None,
-      "departmentName": profile["department_name"] if profile else None, "isHod": is_hod, "assignments": assignments}
+      "departmentName": profile["department_name"] if profile else None,
+      "collegeName": profile["college_name"] if profile else "", "isHod": is_hod, "assignments": assignments}
 
 
 def session_user(db: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
@@ -352,6 +498,18 @@ def gmail_address(value: str) -> str:
         or local.startswith(".") or local.endswith(".") or ".." in local
         or any(not (char.isalnum() or char in ".!#$%&'*+/=?^_`{|}~-") for char in local)):
         raise HTTPException(422, "Use a valid @gmail.com address so we can verify your inbox.")
+    return email
+
+
+def verified_email_address(value: str) -> str:
+    email = value.strip().lower()
+    valid = (len(email) <= 254 and email.count("@") == 1
+             and re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", email)
+             and not email.split("@", 1)[0].startswith(".")
+             and not email.split("@", 1)[0].endswith(".")
+             and ".." not in email.split("@", 1)[0])
+    if not valid:
+        raise HTTPException(422, "Enter a valid email address.")
     return email
 
 
@@ -422,6 +580,44 @@ def login(body: LoginInput) -> dict[str, Any]:
         user = db.execute("SELECT * FROM users WHERE email=? COLLATE NOCASE AND active=1", (body.email,)).fetchone()
         if user is None or not verify_secret(body.password, user["password_hash"]):
             raise HTTPException(401, "Email or password is incorrect.")
+        return make_session(db, user["id"])
+
+
+@app.post("/api/auth/google/identity")
+def google_identity(body: GoogleCredentialInput) -> dict[str, str]:
+    identity = verify_google_credential(body.credential, body.nonce)
+    return {"name": identity["name"], "email": identity["email"]}
+
+
+@app.post("/api/auth/google/nonce")
+def google_nonce() -> dict[str, str]:
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Google sign-in is not configured on the API server.")
+    nonce = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).replace(microsecond=0).isoformat()
+    with connect() as db:
+        db.execute("DELETE FROM google_login_nonces WHERE expires_at<=?", (now_iso(),))
+        db.execute("INSERT INTO google_login_nonces(nonce_hash,expires_at) VALUES (?,?)",
+                   (digest_token(nonce), expires))
+    return {"nonce": nonce}
+
+
+@app.post("/api/auth/google/login")
+def google_login(body: GoogleCredentialInput) -> dict[str, Any]:
+    identity = verify_google_credential(body.credential, body.nonce)
+    consume_google_nonce(body.nonce)
+    with connect() as db:
+        user = db.execute("SELECT * FROM users WHERE google_sub=?", (identity["sub"],)).fetchone()
+        if user is None:
+            user = db.execute("SELECT * FROM users WHERE email=? COLLATE NOCASE", (identity["email"],)).fetchone()
+            if user is None:
+                raise HTTPException(404, "No True Eye account uses this Google account yet. Create an account first.")
+            if user["google_sub"] and user["google_sub"] != identity["sub"]:
+                raise HTTPException(409, "This email is already connected to a different Google account.")
+            db.execute("UPDATE users SET google_sub=? WHERE id=?", (identity["sub"], user["id"]))
+            user = db.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+        if not user["active"]:
+            raise HTTPException(403, "This account is disabled. Contact your institution.")
         return make_session(db, user["id"])
 
 
@@ -520,6 +716,76 @@ def signup_teacher(body: TeacherSignup) -> dict[str, Any]:
     return signup_common(body, "teacher")
 
 
+@app.post("/api/auth/google/signup/student")
+def google_signup_student(body: GoogleStudentSignup) -> dict[str, Any]:
+    identity = verify_google_credential(body.credential, body.nonce)
+    consume_google_nonce(body.nonce)
+    email = verified_email_address(body.email)
+    if email != identity["email"].lower():
+        raise HTTPException(400, "Verify the same email address you entered in the signup form.")
+    branch, section = body.branch.strip().upper(), body.section.strip().upper()
+    if not branch or not section or not body.studentId.strip():
+        raise HTTPException(422, "Enter your roll number, programme, year, and class section.")
+    with connect() as db:
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (identity["email"],)).fetchone():
+            raise HTTPException(409, "An account already uses this Google email. Sign in instead.")
+        sid = body.studentId.strip()
+        if db.execute("SELECT 1 FROM student_profiles WHERE student_id=?", (sid,)).fetchone():
+            raise HTTPException(409, "That roll number already has a True Eye account.")
+        user_id = uid()
+        db.execute("INSERT INTO users(id,email,password_hash,role,name,created_at,google_sub,college_name) VALUES (?,?,?,?,?,?,?,?)",
+                   (user_id, email, hash_secret(body.password), "student",
+                    body.name.strip(), now_iso(), identity["sub"], SAHE_INSTITUTION_NAME))
+        db.execute("INSERT OR IGNORE INTO students(student_id,name,embedding) VALUES (?,?,?)",
+                   (sid, body.name.strip(), b""))
+        section_id = f"{branch}-{body.year}-{section}"
+        db.execute("INSERT OR IGNORE INTO sections(id,branch,year,section) VALUES (?,?,?,?)",
+                   (section_id, branch, body.year, section))
+        db.execute("INSERT INTO student_profiles(user_id,student_id,section_id,joined_at,enrollment_status) VALUES (?,?,?,?,'pending')",
+                   (user_id, sid, section_id, now_iso()))
+        return make_session(db, user_id)
+
+
+@app.post("/api/auth/google/signup/teacher")
+def google_signup_teacher(body: GoogleTeacherSignup) -> dict[str, Any]:
+    identity = verify_google_credential(body.credential, body.nonce)
+    consume_google_nonce(body.nonce)
+    email = verified_email_address(body.email)
+    if email != identity["email"].lower():
+        raise HTTPException(400, "Verify the same email address you entered in the signup form.")
+    with connect() as db:
+        payload = consume_invite(db, body.inviteCode, "teacher")
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (identity["email"],)).fetchone():
+            raise HTTPException(409, "An account already uses this Google email. Sign in instead.")
+        user_id = uid()
+        db.execute("INSERT INTO users(id,email,password_hash,role,name,created_at,google_sub,college_name) VALUES (?,?,?,?,?,?,?,?)",
+                   (user_id, email, hash_secret(body.password), "teacher",
+                    body.name.strip(), now_iso(), identity["sub"], SAHE_INSTITUTION_NAME))
+        db.execute("INSERT INTO teacher_profiles(user_id) VALUES (?)", (user_id,))
+        dept_name = str(payload.get("departmentName", "")).strip()
+        if dept_name:
+            dept_id, join_code = uid(), secrets.token_urlsafe(24)
+            db.execute("INSERT INTO departments(id,name,join_code_hash,created_at,hod_user_id) VALUES (?,?,?,?,?)",
+                       (dept_id, dept_name, digest_token(join_code), now_iso(), user_id))
+            db.execute("UPDATE teacher_profiles SET department_id=? WHERE user_id=?", (dept_id, user_id))
+            db.execute("INSERT INTO department_members(department_id,user_id,joined_at,role,manage_timetable,mark_attendance,enroll_students,post_announcements,view_analytics) VALUES (?,?,?,'hod',1,1,1,1,1)",
+                       (dept_id, user_id, now_iso()))
+        for item in payload.get("assignments", []):
+            branch, year = str(item["branch"]).strip().upper(), int(item["year"])
+            section = str(item["section"]).strip().upper()
+            code, name = str(item["subjectCode"]).strip().upper(), str(item["subjectName"]).strip()
+            section_id = f"{branch}-{year}-{section}"
+            db.execute("INSERT OR IGNORE INTO sections(id,branch,year,section) VALUES (?,?,?,?)",
+                       (section_id, branch, year, section))
+            db.execute("INSERT INTO subjects(id,code,name,branch,year) VALUES (?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name,branch=excluded.branch,year=excluded.year",
+                       (code, code, name, branch, year))
+            db.execute("INSERT OR IGNORE INTO teaching_assignments(id,teacher_id,subject_id,section_id) VALUES (?,?,?,?)",
+                       (uid(), user_id, code, section_id))
+        db.execute("UPDATE activation_invites SET used_at=? WHERE code_hash=?",
+                   (now_iso(), digest_token(body.inviteCode)))
+        return make_session(db, user_id)
+
+
 @app.get("/api/auth/me")
 def me(user: sqlite3.Row = Depends(get_user)) -> dict[str, Any]:
     with connect() as db:
@@ -596,10 +862,279 @@ def slot_obj(row: sqlite3.Row) -> dict[str, Any]:
       "dayOfWeek": row["day_of_week"], "startTime": row["start_time"], "endTime": row["end_time"], "room": row["room"]}
 
 
+def effective_section_schedule(db: sqlite3.Connection, section_id: str, target: date) -> list[dict[str, Any]]:
+    rows = db.execute("""SELECT ts.*,e.kind exception_kind,e.start_time exception_start,
+        e.end_time exception_end,e.room exception_room
+        FROM timetable_slots ts LEFT JOIN timetable_exceptions e
+          ON e.slot_id=ts.id AND e.date=?
+        WHERE ts.section_id=? AND ts.day_of_week=?
+          AND NOT EXISTS (SELECT 1 FROM timetable_exceptions added
+            WHERE added.slot_id=ts.id AND added.kind='add')
+        ORDER BY ts.start_time""", (target.isoformat(), section_id, target.isoweekday())).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if row["exception_kind"] == "cancel":
+            continue
+        slot = slot_obj(row)
+        if row["exception_kind"] == "modify":
+            slot["startTime"] = row["exception_start"] or slot["startTime"]
+            slot["endTime"] = row["exception_end"] or slot["endTime"]
+            slot["room"] = row["exception_room"] if row["exception_room"] is not None else slot["room"]
+            slot["dateChange"] = "modified"
+        result.append(slot)
+
+    additions = db.execute("""SELECT ts.* FROM timetable_exceptions e
+        JOIN timetable_slots ts ON ts.id=e.slot_id
+        WHERE e.date=? AND e.section_id=? AND e.kind='add'
+          AND e.cancelled=0
+        ORDER BY ts.start_time""", (target.isoformat(), section_id)).fetchall()
+    result.extend({**slot_obj(row), "dateChange": "added"} for row in additions)
+    return sorted(result, key=lambda slot: (slot["startTime"], slot["endTime"]))
+
+
+def record_camera_run(
+    db: sqlite3.Connection, section_id: str, slot_id: str, target: date,
+    camera_id: str, event_type: str, observed_at: datetime,
+) -> None:
+    if event_type not in ("entry", "exit"):
+        raise ValueError("Camera event type must be entry or exit.")
+    stamp = observed_at.isoformat(timespec="seconds")
+    db.execute("""INSERT INTO camera_runs
+        (camera_id,event_type,section_id,slot_id,date,started_at,last_heartbeat_at,heartbeat_count)
+        VALUES (?,?,?,?,?,?,?,1)
+        ON CONFLICT(camera_id,event_type,slot_id,date) DO UPDATE SET
+          last_heartbeat_at=excluded.last_heartbeat_at,heartbeat_count=camera_runs.heartbeat_count+1""",
+        (camera_id,event_type,section_id,slot_id,target.isoformat(),stamp,stamp))
+
+
+def record_camera_attendance_event(
+    db: sqlite3.Connection, section_id: str, slot: dict[str, Any], target: date,
+    student_id: str, camera_id: str, event_type: str, observed_at: datetime,
+    score: float, late_grace_minutes: int = 10, early_exit_review_minutes: int = 5,
+) -> bool:
+    if event_type not in ("entry", "exit"):
+        raise ValueError("Camera event type must be entry or exit.")
+    if not 0 <= score <= 1:
+        raise ValueError("Face-match score must be between 0 and 1.")
+    if slot["sectionId"] != section_id:
+        raise ValueError("Camera event slot does not belong to the configured section.")
+
+    day_start = datetime.combine(target, time.fromisoformat(slot["startTime"]))
+    day_end = datetime.combine(target, time.fromisoformat(slot["endTime"]))
+    event_clock = observed_at.replace(tzinfo=None)
+    event_end = day_end + (timedelta(minutes=5) if event_type == "exit" else timedelta())
+    if event_clock < day_start or event_clock > event_end:
+        return False
+    approved = db.execute("""SELECT 1 FROM student_profiles
+        WHERE student_id=? AND section_id=? AND enrollment_status='approved'""",
+        (student_id,section_id)).fetchone()
+    if approved is None:
+        return False
+    if db.execute("SELECT 1 FROM attendance_sessions WHERE slot_id=? AND date=?",
+                  (slot["id"],target.isoformat())).fetchone():
+        return False
+
+    stamp = observed_at.isoformat(timespec="seconds")
+    inserted = db.execute("""INSERT OR IGNORE INTO camera_attendance_events
+        (id,student_id,slot_id,date,event_type,camera_id,observed_at,score)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (uid(),student_id,slot["id"],target.isoformat(),event_type,camera_id,stamp,score))
+    if inserted.rowcount == 0:
+        return False
+
+    clock = observed_at.strftime("%H:%M:%S")
+    current = db.execute("""SELECT id,status,in_time,method FROM class_attendance
+        WHERE student_id=? AND slot_id=? AND date=?""",
+        (student_id,slot["id"],target.isoformat())).fetchone()
+    if current is None:
+        status = "present"
+        in_time = None
+        if event_type == "entry":
+            late_after = day_start + timedelta(minutes=late_grace_minutes)
+            status = "late" if event_clock > late_after else "present"
+            in_time = clock
+        db.execute("""INSERT INTO class_attendance
+            (id,student_id,slot_id,date,status,in_time,out_time,method,marked_by,created_at)
+            VALUES (?,?,?,?,?,?,NULL,'face',?,?)""",
+            (uid(),student_id,slot["id"],target.isoformat(),status,in_time,slot["teacherId"],stamp))
+    elif current["method"] == "face" and event_type == "entry" and (
+        current["in_time"] is None or clock < current["in_time"]
+    ):
+        late_after = day_start + timedelta(minutes=late_grace_minutes)
+        status = "late" if event_clock > late_after else "present"
+        db.execute("UPDATE class_attendance SET status=?,in_time=? WHERE id=?",
+                   (status,clock,current["id"]))
+
+    if event_type == "exit" and event_clock <= day_end - timedelta(minutes=early_exit_review_minutes):
+        db.execute("""INSERT INTO camera_attendance_reviews
+            (student_id,slot_id,date,reason,flagged_at)
+            VALUES (?,?,?,'early_exit',?)
+            ON CONFLICT(student_id,slot_id,date) DO UPDATE SET
+              reason='early_exit',flagged_at=excluded.flagged_at,
+              resolved_at=NULL,resolved_by=NULL""",
+            (student_id,slot["id"],target.isoformat(),stamp))
+    return True
+
+
+def ranges_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
+    return start_a < end_b and end_a > start_b
+
+
+def validate_timetable_change(
+    db: sqlite3.Connection, body: TimetableChangeInput, user: sqlite3.Row
+) -> dict[str, Any]:
+    try:
+        target = date.fromisoformat(body.date)
+        if target.isoformat() != body.date:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(422, "Date must use YYYY-MM-DD.") from exc
+    if target < date.today():
+        raise HTTPException(422, "Timetable changes can only be published for today or a future date.")
+    if target.isoweekday() > 6:
+        raise HTTPException(422, "Timetable changes are only available Monday through Saturday.")
+
+    if db.execute("SELECT 1 FROM teaching_assignments WHERE teacher_id=? AND section_id=? LIMIT 1",
+                  (user["id"], body.sectionId)).fetchone() is None:
+        raise HTTPException(403, "You can only change a class you are assigned to teach.")
+
+    if body.kind in ("cancel", "modify"):
+        if not body.slotId:
+            raise HTTPException(422, "Choose the scheduled period to change.")
+        slot = db.execute("SELECT * FROM timetable_slots WHERE id=? AND section_id=? AND day_of_week=?",
+                          (body.slotId, body.sectionId, target.isoweekday())).fetchone()
+        existing = db.execute("SELECT * FROM timetable_exceptions WHERE date=? AND slot_id=?",
+                              (body.date, body.slotId)).fetchone()
+        added = existing is not None and existing["kind"] == "add"
+        if slot is None or (added and body.kind != "cancel"):
+            raise HTTPException(404, "That recurring period is not on the selected date.")
+        if db.execute("SELECT 1 FROM teaching_assignments WHERE teacher_id=? AND section_id=? AND subject_id=?",
+                      (user["id"], body.sectionId, slot["subject_id"])).fetchone() is None:
+            raise HTTPException(403, "You can only change a period for a subject you are assigned to teach.")
+        if existing is not None and existing["kind"] == "add" and existing["cancelled"]:
+            raise HTTPException(409, "This extra period has already been cancelled.")
+        if body.kind == "cancel":
+            cancelled_slot = slot_obj(slot)
+            if added:
+                cancelled_slot["dateChange"] = "added"
+            return {"target": target, "slot": cancelled_slot, "startTime": slot["start_time"],
+                    "endTime": slot["end_time"], "room": slot["room"], "subjectId": slot["subject_id"],
+                    "cancels_added": added}
+        start_value = body.startTime or slot["start_time"]
+        end_value = body.endTime or slot["end_time"]
+        room_value = body.room if body.room is not None else slot["room"]
+        if body.startTime is not None or body.endTime is not None:
+            try:
+                start = time.fromisoformat(start_value)
+                end = time.fromisoformat(end_value)
+                if start.strftime("%H:%M") != start_value or end.strftime("%H:%M") != end_value or start >= end:
+                    raise ValueError
+            except ValueError as exc:
+                raise HTTPException(422, "Use valid 24-hour HH:MM times, with the end after the start.") from exc
+        candidate = {**slot_obj(slot), "startTime": start_value, "endTime": end_value, "room": room_value}
+        excluded_slot_id = body.slotId
+    else:
+        if not body.subjectId:
+            raise HTTPException(422, "Choose an assigned subject for the extra period.")
+        assignment = db.execute("SELECT 1 FROM teaching_assignments WHERE teacher_id=? AND section_id=? AND subject_id=?",
+                                (user["id"], body.sectionId, body.subjectId)).fetchone()
+        if assignment is None:
+            raise HTTPException(403, "Choose a subject assigned to you for this class.")
+        if not body.startTime or not body.endTime:
+            raise HTTPException(422, "Enter a start and end time for the extra period.")
+        try:
+            start = time.fromisoformat(body.startTime)
+            end = time.fromisoformat(body.endTime)
+            if start.strftime("%H:%M") != body.startTime or end.strftime("%H:%M") != body.endTime or start >= end:
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(422, "Use valid 24-hour HH:MM times, with the end after the start.") from exc
+        reserved = db.execute("""SELECT 1 FROM timetable_slots
+            WHERE section_id=? AND day_of_week=? AND start_time=? LIMIT 1""",
+            (body.sectionId, target.isoweekday(), body.startTime)).fetchone()
+        if reserved:
+            raise HTTPException(409, "That start time is already reserved by a recurring or previously used period. Choose another start time.")
+        subject = db.execute("SELECT code FROM subjects WHERE id=?", (body.subjectId,)).fetchone()
+        candidate = {
+            "id": "", "sectionId": body.sectionId, "subjectId": body.subjectId,
+            "teacherId": user["id"], "dayOfWeek": target.isoweekday(),
+            "startTime": body.startTime, "endTime": body.endTime, "room": body.room or "",
+            "subjectCode": subject["code"] if subject else body.subjectId,
+        }
+        excluded_slot_id = None
+
+    if body.kind != "cancel":
+        for existing in effective_section_schedule(db, body.sectionId, target):
+            if existing["id"] != excluded_slot_id and ranges_overlap(
+                candidate["startTime"], candidate["endTime"], existing["startTime"], existing["endTime"]
+            ):
+                raise HTTPException(409, f"This change overlaps another period ({existing['startTime']}–{existing['endTime']}).")
+        teacher_slots = db.execute("SELECT DISTINCT section_id FROM teaching_assignments WHERE teacher_id=?",
+                                   (user["id"],)).fetchall()
+        for section in teacher_slots:
+            for existing in effective_section_schedule(db, section["section_id"], target):
+                if (existing["id"] != excluded_slot_id and existing["sectionId"] != body.sectionId
+                        and ranges_overlap(candidate["startTime"], candidate["endTime"],
+                                           existing["startTime"], existing["endTime"])):
+                    raise HTTPException(409, f"This change conflicts with your other class ({existing['sectionId']}, {existing['startTime']}–{existing['endTime']}).")
+    return {"target": target, "slot": candidate, "startTime": candidate["startTime"],
+            "endTime": candidate["endTime"], "room": candidate["room"],
+            "subjectId": candidate["subjectId"]}
+
+
+@app.post("/api/teacher/timetable/changes/preview")
+def preview_timetable_change(body: TimetableChangeInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with connect() as db:
+        result = validate_timetable_change(db, body, user)
+        return {"kind": body.kind, "date": body.date, "slot": result["slot"]}
+
+
+@app.post("/api/teacher/timetable/changes")
+def create_timetable_change(body: TimetableChangeInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with connect() as db:
+        validated = validate_timetable_change(db, body, user)
+        slot_id = body.slotId
+        if body.kind == "add":
+            slot_id = uid()
+            db.execute("""INSERT INTO timetable_slots(id,section_id,subject_id,teacher_id,day_of_week,start_time,end_time,room)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (slot_id, body.sectionId, body.subjectId, user["id"], validated["target"].isoweekday(),
+                 validated["startTime"], validated["endTime"], validated["room"]))
+        assert slot_id is not None
+        if body.kind == "cancel" and validated.get("cancels_added"):
+            db.execute("UPDATE timetable_exceptions SET cancelled=1 WHERE date=? AND slot_id=? AND kind='add'",
+                       (body.date, slot_id))
+        else:
+            db.execute("""INSERT INTO timetable_exceptions(id,date,section_id,slot_id,kind,start_time,end_time,room,created_by,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(date,slot_id) DO UPDATE SET kind=excluded.kind,
+                  start_time=excluded.start_time,end_time=excluded.end_time,room=excluded.room,
+                  cancelled=0,created_by=excluded.created_by,created_at=excluded.created_at""",
+                (uid(), body.date, body.sectionId, slot_id, body.kind,
+                 validated["startTime"] if body.kind == "modify" else None,
+                 validated["endTime"] if body.kind == "modify" else None,
+                 validated["room"] if body.kind == "modify" else None, user["id"], now_iso()))
+        return {"message": "Date-specific timetable change published."}
+
+
 def record_obj(row: sqlite3.Row, section_id: str, subject_id: str = "", slot_id: str = "") -> dict[str, Any]:
     return {"id": row["id"], "studentId": row["student_id"], "subjectId": subject_id, "slotId": slot_id,
       "sectionId": section_id, "date": row["date"], "status": row["status"], "inTime": row["in_time"],
       "outTime": row["out_time"], "method": row["method"], "markedBy": row["marked_by"]}
+
+
+def attendance_review(db: sqlite3.Connection, student_id: str, target: str,
+                      slot_id: str | None = None) -> dict[str, Any]:
+    query = """SELECT reason FROM camera_attendance_reviews
+        WHERE student_id=? AND date=? AND resolved_at IS NULL"""
+    values: tuple[Any, ...] = (student_id,target)
+    if slot_id:
+        query += " AND slot_id=?"
+        values += (slot_id,)
+    query += " ORDER BY flagged_at LIMIT 1"
+    review = db.execute(query,values).fetchone()
+    return {"reviewRequired": review is not None,
+            "reviewReason": review["reason"] if review else None}
 
 
 @app.get("/api/student/attendance")
@@ -620,7 +1155,10 @@ def student_attendance(from_: str = __import__("fastapi").Query(default="", alia
         legacy = db.execute(q, args).fetchall()
         result = [record_obj({"id": str(r["id"]), "student_id": r["student_id"], "date": r["date"], "in_time": r["in_time"], "out_time": r["out_time"], "status": "present", "method": "face", "marked_by": None}, p["sectionId"], "", "") for r in legacy]
         # Explicit period records carry a reliable timetable association.
-        q2 = "SELECT ca.*,ts.subject_id,ts.id slot_id FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id WHERE ca.student_id=?"
+        q2 = """SELECT ca.*,ts.subject_id,ts.id slot_id FROM class_attendance ca
+          JOIN timetable_slots ts ON ts.id=ca.slot_id
+          JOIN attendance_sessions ses ON ses.slot_id=ca.slot_id AND ses.date=ca.date
+          WHERE ca.student_id=?"""
         a2: list[Any] = [p["studentId"]]
         if from_: q2 += " AND ca.date>=?"; a2.append(from_)
         if to: q2 += " AND ca.date<=?"; a2.append(to)
@@ -639,6 +1177,7 @@ def student_summary(user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any
           COUNT(*) held_count,SUM(ca.status='present') present_count,SUM(ca.status='absent') absent_count,
           SUM(ca.status='late') late_count,SUM(ca.status='excused') excused_count
           FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id JOIN subjects s ON s.id=ts.subject_id
+          JOIN attendance_sessions ses ON ses.slot_id=ca.slot_id AND ses.date=ca.date
           WHERE ca.student_id=? GROUP BY s.id""", (p["studentId"],)).fetchall()
         return [{"subjectId": r["subject_id"], "subjectCode": r["subject_code"], "subjectName": r["subject_name"],
           "heldCount": r["held_count"], "presentCount": r["present_count"], "absentCount": r["absent_count"],
@@ -654,14 +1193,24 @@ def student_schedule(date_: str = __import__("fastapi").Query(default="", alias=
     with connect() as db:
         p = student_profile(db, user)
         require_approved_student(db, user)
-        slots = db.execute("""SELECT ts.*,su.code,su.name subject_name,su.branch,su.year,u.name teacher_name
-          FROM timetable_slots ts JOIN subjects su ON su.id=ts.subject_id JOIN users u ON u.id=ts.teacher_id
-          WHERE ts.section_id=? AND ts.day_of_week=? ORDER BY ts.start_time""", (p["sectionId"], target.isoweekday())).fetchall()
         result = []
-        for slot in slots:
-            row = db.execute("SELECT * FROM class_attendance WHERE student_id=? AND slot_id=? AND date=?", (p["studentId"],slot["id"],target.isoformat())).fetchone()
-            rec = record_obj(row, p["sectionId"], slot["subject_id"], slot["id"]) if row else None
-            result.append({"slot":slot_obj(slot), "subject":{"id":slot["subject_id"],"code":slot["code"],"name":slot["subject_name"],"branch":slot["branch"],"year":slot["year"]},"teacherName":slot["teacher_name"],"record":rec,"status":row["status"] if row else "unmarked"})
+        for slot in effective_section_schedule(db, p["sectionId"], target):
+            subject = db.execute("SELECT * FROM subjects WHERE id=?", (slot["subjectId"],)).fetchone()
+            teacher = db.execute("SELECT name FROM users WHERE id=?", (slot["teacherId"],)).fetchone()
+            row = db.execute("SELECT * FROM class_attendance WHERE student_id=? AND slot_id=? AND date=?",
+                             (p["studentId"], slot["id"], target.isoformat())).fetchone()
+            rec = record_obj(row, p["sectionId"], slot["subjectId"], slot["id"]) if row else None
+            result.append({
+                "slot": slot,
+                "subject": {
+                    "id": slot["subjectId"], "code": subject["code"] if subject else slot["subjectId"],
+                    "name": subject["name"] if subject else slot["subjectId"],
+                    "branch": subject["branch"] if subject else "",
+                    "year": subject["year"] if subject else 0,
+                },
+                "teacherName": teacher["name"] if teacher else "",
+                "record": rec, "status": row["status"] if row else "unmarked",
+            })
         return result
 
 
@@ -671,29 +1220,63 @@ def teacher_assignments(user: sqlite3.Row = Depends(require_teacher)) -> list[di
 
 
 @app.get("/api/timetable")
-def timetable(sectionId: str, user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any]]:
+def timetable(sectionId: str, date_: str = __import__("fastapi").Query(default="", alias="date"),
+              user: sqlite3.Row = Depends(get_user)) -> list[dict[str, Any]]:
     with connect() as db:
         if user["role"] == "student":
             require_approved_student(db,user)
             if student_profile(db,user)["sectionId"] != sectionId: raise HTTPException(403,"You cannot view this class timetable.")
         else:
             require_assignment(db,user["id"],sectionId)
-        return [slot_obj(r) for r in db.execute("SELECT * FROM timetable_slots WHERE section_id=? ORDER BY day_of_week,start_time",(sectionId,)).fetchall()]
+        if date_:
+            try:
+                target = date.fromisoformat(date_)
+                if target.isoformat() != date_:
+                    raise ValueError
+            except ValueError as exc:
+                raise HTTPException(422, "Date must use YYYY-MM-DD.") from exc
+            return effective_section_schedule(db, sectionId, target)
+        return [slot_obj(r) for r in db.execute("""SELECT ts.* FROM timetable_slots ts
+          WHERE ts.section_id=? AND NOT EXISTS (SELECT 1 FROM timetable_exceptions e
+            WHERE e.slot_id=ts.id AND e.kind='add')
+          ORDER BY ts.day_of_week,ts.start_time""",(sectionId,)).fetchall()]
 
 
 @app.get("/api/teacher/schedule")
 def teacher_schedule(date_: str = __import__("fastapi").Query(default="", alias="date"), user: sqlite3.Row = Depends(require_teacher)) -> list[dict[str, Any]]:
-    try: day=(date.fromisoformat(date_) if date_ else date.today()).isoweekday()
+    try:
+        target = date.fromisoformat(date_) if date_ else date.today()
+        if date_ and target.isoformat() != date_:
+            raise ValueError
     except ValueError as exc: raise HTTPException(422,"Date must use YYYY-MM-DD.") from exc
-    with connect() as db: return [slot_obj(r) for r in db.execute("SELECT * FROM timetable_slots WHERE teacher_id=? AND day_of_week=? ORDER BY start_time",(user["id"],day)).fetchall()]
+    with connect() as db:
+        sections = sections_for_teacher(db, user["id"])
+        slots = [slot for section in sections for slot in effective_section_schedule(db, section["id"], target)]
+        profile = db.execute("SELECT department_id FROM teacher_profiles WHERE user_id=?", (user["id"],)).fetchone()
+        hod = profile is not None and profile["department_id"] is not None and db.execute(
+            "SELECT 1 FROM departments WHERE id=? AND hod_user_id=?",
+            (profile["department_id"], user["id"]),
+        ).fetchone() is not None
+        visible = slots if hod else [slot for slot in slots if slot["teacherId"] == user["id"]]
+        return sorted(visible,
+                      key=lambda slot: (slot["startTime"], slot["endTime"]))
 
 
 @app.get("/api/teacher/roster")
 def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alias="date"), slotId: str | None = None, user: sqlite3.Row = Depends(require_teacher)) -> list[dict[str, Any]]:
-    try: target=date.fromisoformat(date_)
+    try:
+        target=date.fromisoformat(date_)
+        if target.isoformat() != date_:
+            raise ValueError
     except ValueError as exc: raise HTTPException(422,"Date must use YYYY-MM-DD.") from exc
     with connect() as db:
-        require_assignment(db,user["id"],sectionId,slotId)
+        if slotId and db.execute("""SELECT 1 FROM timetable_exceptions
+          WHERE date=? AND slot_id=? AND (kind='cancel' OR (kind='add' AND cancelled=1))""",
+                                 (target.isoformat(), slotId)).fetchone():
+            raise HTTPException(409, "This period was cancelled for that date.")
+        require_assignment(db,user["id"],sectionId)
+        if slotId and not any(slot["id"] == slotId for slot in effective_section_schedule(db, sectionId, target)):
+            raise HTTPException(404, "Period is not scheduled for that class and date.")
         if slotId and db.execute("SELECT 1 FROM timetable_slots WHERE id=? AND section_id=?",(slotId,sectionId)).fetchone() is None: raise HTTPException(404,"Period not found.")
         students=db.execute("""SELECT s.student_id,s.name,p.enrollment_status FROM student_profiles p JOIN students s ON s.student_id=p.student_id
           WHERE p.section_id=? ORDER BY s.name""",(sectionId,)).fetchall()
@@ -703,10 +1286,42 @@ def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alia
             if slotId: q+=" AND slot_id=?";args.append(slotId)
             rows=db.execute(q+" ORDER BY in_time",args).fetchall()
             if not rows:
-                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None,"enrollmentStatus":student["enrollment_status"]})
+                review=attendance_review(db,student["student_id"],target.isoformat(),slotId)
+                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None,"enrollmentStatus":student["enrollment_status"],**review})
             else:
-                for row in rows: result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"],"enrollmentStatus":student["enrollment_status"]})
+                for row in rows:
+                    review=attendance_review(db,student["student_id"],target.isoformat(),row["slot_id"])
+                    result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"],"enrollmentStatus":student["enrollment_status"],**review})
         return result
+
+
+@app.get("/api/teacher/attendance/session")
+def attendance_session(sectionId: str, date_: str = __import__("fastapi").Query(alias="date"),
+                       slotId: str = "", user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    try:
+        target = date.fromisoformat(date_)
+        if target.isoformat() != date_:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(422, "Date must use YYYY-MM-DD.") from exc
+    if not slotId:
+        raise HTTPException(422, "Choose a scheduled period.")
+    with connect() as db:
+        require_assignment(db, user["id"], sectionId)
+        scheduled = next((slot for slot in effective_section_schedule(db, sectionId, target)
+                          if slot["id"] == slotId), None)
+        if scheduled is None:
+            raise HTTPException(404, "Period not found for that teacher and date.")
+        session = db.execute(
+            "SELECT completed_at FROM attendance_sessions WHERE section_id=? AND slot_id=? AND date=?",
+            (sectionId, slotId, date_.strip()),
+        ).fetchone()
+        camera_session = db.execute(
+            "SELECT 1 FROM camera_runs WHERE section_id=? AND slot_id=? AND date=? LIMIT 1",
+            (sectionId,slotId,date_.strip()),
+        ).fetchone() is not None
+        return {"completed": session is not None, "completedAt": session["completed_at"] if session else None,
+                "cameraSession": camera_session}
 
 
 class StudentReviewInput(BaseModel):
@@ -727,12 +1342,27 @@ def review_student(student_id: str, body: StudentReviewInput, user: sqlite3.Row 
 
 @app.patch("/api/teacher/attendance")
 def mark_attendance(body: MarkInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
-    try: date.fromisoformat(body.date)
-    except ValueError as exc: raise HTTPException(422,"Date must use YYYY-MM-DD.") from exc
+    try:
+        target = date.fromisoformat(body.date)
+        if target.isoformat() != body.date:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(422,"Date must use YYYY-MM-DD.") from exc
+    if target > date.today():
+        raise HTTPException(422, "Attendance cannot be marked for a future date.")
     with connect() as db:
+        exception = db.execute("SELECT kind,cancelled FROM timetable_exceptions WHERE date=? AND slot_id=? AND section_id=?",
+                               (body.date, body.slotId, body.sectionId)).fetchone()
+        if exception and (exception["kind"] == "cancel" or
+                          (exception["kind"] == "add" and exception["cancelled"])):
+            raise HTTPException(409, "This period was cancelled for that date.")
         require_assignment(db,user["id"],body.sectionId,body.slotId)
         slot=db.execute("SELECT * FROM timetable_slots WHERE id=? AND section_id=?",(body.slotId,body.sectionId)).fetchone()
         if slot is None: raise HTTPException(404,"Period not found.")
+        scheduled = next((item for item in effective_section_schedule(db, body.sectionId, target)
+                          if item["id"] == body.slotId and item["teacherId"] == user["id"]), None)
+        if scheduled is None:
+            raise HTTPException(404, "Period is not scheduled for you on that date.")
         student=db.execute("SELECT enrollment_status FROM student_profiles WHERE student_id=? AND section_id=?",(body.studentId,body.sectionId)).fetchone()
         if student is None: raise HTTPException(404,"Student is not in this class.")
         if student["enrollment_status"]!="approved": raise HTTPException(409,"Approve the student's class membership before marking attendance.")
@@ -743,31 +1373,123 @@ def mark_attendance(body: MarkInput, user: sqlite3.Row = Depends(require_teacher
           VALUES (?,?,?,?,?,?,NULL,'manual',?,?) ON CONFLICT(student_id,slot_id,date) DO UPDATE SET
           status=excluded.status,in_time=excluded.in_time,method='manual',marked_by=excluded.marked_by""",
           (row_id,body.studentId,body.slotId,body.date,body.status,stamp,user["id"],now_iso()))
+        db.execute("""UPDATE camera_attendance_reviews SET resolved_at=?,resolved_by=?
+          WHERE student_id=? AND slot_id=? AND date=? AND resolved_at IS NULL""",
+          (now_iso(),user["id"],body.studentId,body.slotId,body.date))
         row=db.execute("SELECT * FROM class_attendance WHERE id=?",(row_id,)).fetchone()
         return record_obj(row,body.sectionId,slot["subject_id"],slot["id"])
 
 
+@app.post("/api/teacher/attendance/complete")
+def complete_attendance(body: CompleteAttendanceInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    try:
+        target = date.fromisoformat(body.date)
+        if target.isoformat() != body.date:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(422, "Date must use YYYY-MM-DD.") from exc
+    if target > date.today():
+        raise HTTPException(422, "A future period cannot be completed.")
+    with connect() as db:
+        require_assignment(db, user["id"], body.sectionId, body.slotId)
+        scheduled = next((item for item in effective_section_schedule(db, body.sectionId, target)
+                          if item["id"] == body.slotId and item["teacherId"] == user["id"]), None)
+        if scheduled is None:
+            raise HTTPException(404, "Period is not scheduled for you on that date.")
+        existing = db.execute(
+            "SELECT completed_at FROM attendance_sessions WHERE section_id=? AND slot_id=? AND date=?",
+            (body.sectionId, body.slotId, body.date),
+        ).fetchone()
+        if existing:
+            return {"completed": True, "completedAt": existing["completed_at"], "absencesAdded": 0, "reviewRequired": 0}
+        if target == date.today() and scheduled["endTime"] > datetime.now().strftime("%H:%M"):
+            raise HTTPException(409, "This period has not ended yet.")
+
+        camera_session = db.execute(
+            "SELECT 1 FROM camera_runs WHERE section_id=? AND slot_id=? AND date=? LIMIT 1",
+            (body.sectionId,body.slotId,body.date),
+        ).fetchone() is not None
+        approved_students = db.execute(
+            "SELECT student_id FROM student_profiles WHERE section_id=? AND enrollment_status='approved'",
+            (body.sectionId,),
+        ).fetchall()
+        if camera_session:
+            for student in approved_students:
+                mark = db.execute("""SELECT 1 FROM class_attendance
+                    WHERE student_id=? AND slot_id=? AND date=?""",
+                    (student["student_id"],body.slotId,body.date)).fetchone()
+                if mark is None:
+                    db.execute("""INSERT OR IGNORE INTO camera_attendance_reviews
+                        (student_id,slot_id,date,reason,flagged_at)
+                        VALUES (?,?,?,'not_observed',?)""",
+                        (student["student_id"],body.slotId,body.date,now_iso()))
+            review_required = db.execute("""SELECT COUNT(*) FROM camera_attendance_reviews
+                WHERE slot_id=? AND date=? AND resolved_at IS NULL""",
+                (body.slotId,body.date)).fetchone()[0]
+            if review_required:
+                return {"completed": False, "completedAt": None, "absencesAdded": 0,
+                        "reviewRequired": review_required}
+
+        completed_at = now_iso()
+        db.execute(
+            "INSERT INTO attendance_sessions(id,section_id,slot_id,date,completed_by,completed_at) VALUES (?,?,?,?,?,?)",
+            (uid(), body.sectionId, body.slotId, body.date, user["id"], completed_at),
+        )
+        absences_added = 0
+        if not camera_session:
+            for student in approved_students:
+                cursor = db.execute("""INSERT OR IGNORE INTO class_attendance
+                    (id,student_id,slot_id,date,status,in_time,out_time,method,marked_by,created_at)
+                    VALUES (?,?,?,?,'absent',NULL,NULL,'manual',?,?)""",
+                    (uid(), student["student_id"], body.slotId, body.date, user["id"], completed_at))
+                absences_added += cursor.rowcount
+        return {"completed": True, "completedAt": completed_at, "absencesAdded": absences_added,
+                "reviewRequired": 0}
+
+
 def parse_timetable(csv_text: str) -> tuple[list[dict[str, Any]], list[str]]:
-    required={"day","start","end","subject_code","subject_name","section","room","teacher_email"}
+    required={"day","start","end","subject_code","subject_name","section"}
     try: reader=csv.DictReader(io.StringIO(csv_text))
     except csv.Error as exc: return [],[str(exc)]
-    if not reader.fieldnames or not required.issubset({x.strip().lower() for x in reader.fieldnames}):
-        return [],["CSV must include: day,start,end,subject_code,subject_name,section,room,teacher_email"]
+    if reader.fieldnames:
+        # Excel's UTF-8 CSV export commonly prefixes the first header with a BOM.
+        aliases = {
+            "weekday": "day", "week_day": "day",
+            "start_time": "start", "from": "start",
+            "end_time": "end", "to": "end",
+            "code": "subject_code", "course_code": "subject_code",
+            "subject": "subject_name", "course_name": "subject_name",
+            "class": "section", "section_id": "section",
+            "room_no": "room", "room_number": "room", "classroom": "room",
+            "instructor_email": "teacher_email", "email": "teacher_email",
+        }
+        normalized = []
+        for heading in reader.fieldnames:
+            key = re.sub(r"[^a-z0-9]+", "_", heading.lstrip("\ufeff").strip().lower()).strip("_")
+            normalized.append(aliases.get(key, key))
+        reader.fieldnames = normalized
+    if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+        return [],["CSV needs columns for day, start time, end time, subject code, subject name, and section. Room and teacher_email are optional."]
     rows=[]; errors=[]; seen=set()
     day_map={"mon":1,"monday":1,"tue":2,"tuesday":2,"wed":3,"wednesday":3,"thu":4,"thursday":4,"fri":5,"friday":5,"sat":6,"saturday":6}
     for line, raw in enumerate(reader,2):
         row={str(k).strip().lower():str(v or "").strip() for k,v in raw.items() if k is not None}
         try:
             day=day_map.get(row.get("day"," ").lower())
-            start=time.fromisoformat(row["start"]); end=time.fromisoformat(row["end"])
+            def parse_hhmm(value: str) -> time:
+                parts = value.strip().split(":")
+                if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                    raise ValueError("time must use H:MM or HH:MM 24-hour format")
+                return time(int(parts[0]), int(parts[1]))
+            start=parse_hhmm(row["start"]); end=parse_hhmm(row["end"])
             code=row["subject_code"].upper(); name=row["subject_name"]
             if day is None: raise ValueError("day must be Mon-Sat")
             if start >= end: raise ValueError("end must be later than start")
-            if not code or not name or not row["section"]: raise ValueError("subject and section are required")
+            if not code or not name or not row["section"]: raise ValueError("subject code, subject name, and section are required")
             key=(day,start.strftime("%H:%M"))
             if key in seen: raise ValueError("duplicate day and start time")
             seen.add(key)
-            rows.append({"line":line,"day":day,"start":start.strftime("%H:%M"),"end":end.strftime("%H:%M"),"code":code,"name":name,"section":row["section"].upper(),"room":row["room"],"email":row["teacher_email"].lower()})
+            rows.append({"line":line,"day":day,"start":start.strftime("%H:%M"),"end":end.strftime("%H:%M"),"code":code,"name":name,"section":row["section"].upper(),"room":row.get("room", ""),"email":row.get("teacher_email", "").lower()})
         except (ValueError,KeyError) as exc: errors.append(f"Line {line}: {exc}")
     return rows,errors
 
@@ -785,12 +1507,31 @@ def validate_timetable(db: sqlite3.Connection, body: TimetableInput, user: sqlit
         if row["email"] and row["email"]!=own: errors.append(f"Line {row['line']}: teacher_email must match your account.");continue
         subject=db.execute("SELECT * FROM subjects WHERE code=?",(row["code"],)).fetchone()
         assignment=db.execute("SELECT 1 FROM teaching_assignments WHERE teacher_id=? AND section_id=? AND subject_id=?",(user["id"],body.sectionId,row["code"])).fetchone()
-        if subject is None or assignment is None: errors.append(f"Line {row['line']}: subject {row['code']} is not in your approved assignment.");continue
+        if subject is None or assignment is None:
+            errors.append(f"Line {row['line']}: subject {row['code']} is not assigned to your account for {body.sectionId}. Ask the SAHE timetable administrator to add this subject to your teaching assignment.")
+            continue
         valid.append(row)
     # Validate overlaps before saving; reject conflicting rows, preserve existing grid.
     for index, row in enumerate(valid):
+        one_off = db.execute("""SELECT e.date FROM timetable_slots ts
+          JOIN timetable_exceptions e ON e.slot_id=ts.id AND e.kind='add' AND e.cancelled=0
+          WHERE ts.section_id=? AND ts.day_of_week=? AND ts.start_time=? LIMIT 1""",
+          (body.sectionId,row["day"],row["start"])).fetchone()
+        if one_off:
+            errors.append(f"Line {row['line']}: period conflicts with a one-time extra class on {one_off['date']}.")
+            row["rejected"] = True
+            continue
+        retained_one_off = db.execute("""SELECT e.date FROM timetable_slots ts
+          JOIN timetable_exceptions e ON e.slot_id=ts.id AND e.kind='add' AND e.cancelled=1
+          WHERE ts.section_id=? AND ts.day_of_week=? AND ts.start_time=? LIMIT 1""",
+          (body.sectionId,row["day"],row["start"])).fetchone()
+        if retained_one_off:
+            errors.append(f"Line {row['line']}: start time is retained for attendance history from a cancelled one-time period on {retained_one_off['date']}; choose another start time.")
+            row["rejected"] = True
+            continue
         overlap=db.execute("""SELECT 1 FROM timetable_slots WHERE section_id=? AND day_of_week=?
-          AND start_time < ? AND end_time > ? AND start_time<>?""",
+          AND start_time < ? AND end_time > ? AND start_time<>?
+          AND NOT EXISTS (SELECT 1 FROM timetable_exceptions e WHERE e.slot_id=timetable_slots.id AND e.kind='add')""",
           (body.sectionId,row["day"],row["end"],row["start"],row["start"])).fetchone()
         if overlap:
             errors.append(f"Line {row['line']}: period overlaps an existing class.")
@@ -801,7 +1542,9 @@ def validate_timetable(db: sqlite3.Connection, body: TimetableInput, user: sqlit
                 row["rejected"] = True
                 break
     valid = [row for row in valid if not row.get("rejected")]
-    imported=sum(db.execute("SELECT 1 FROM timetable_slots WHERE section_id=? AND day_of_week=? AND start_time=?",(body.sectionId,r["day"],r["start"])).fetchone() is None for r in valid)
+    imported=sum(db.execute("""SELECT 1 FROM timetable_slots ts WHERE ts.section_id=? AND ts.day_of_week=? AND ts.start_time=?
+      AND NOT EXISTS (SELECT 1 FROM timetable_exceptions e WHERE e.slot_id=ts.id AND e.kind='add')""",
+      (body.sectionId,r["day"],r["start"])).fetchone() is None for r in valid)
     replaced=len(valid)-imported
     return valid,errors,imported,replaced
 
@@ -989,27 +1732,35 @@ def department_analytics(user: sqlite3.Row=Depends(require_teacher)) -> list[dic
         member=db.execute("SELECT view_analytics FROM department_members WHERE department_id=? AND user_id=?",(dept["id"],user["id"])).fetchone()
         if not member["view_analytics"]: raise HTTPException(403,"Department analytics access is not enabled for you.")
         rows=db.execute("""SELECT ts.section_id, su.id subject_id, su.code, su.name,
-          COUNT(DISTINCT ca.date||':'||ca.slot_id) sessions,COUNT(*) marked,
-          SUM(ca.status IN ('present','late')) present
-          FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id JOIN subjects su ON su.id=ts.subject_id
+          COUNT(DISTINCT ses.id) sessions,COUNT(ca.id) marked,
+          SUM(ca.status IN ('present','late')) present,SUM(ca.status='excused') excused
+          FROM attendance_sessions ses
+          JOIN class_attendance ca ON ca.slot_id=ses.slot_id AND ca.date=ses.date
+          JOIN timetable_slots ts ON ts.id=ses.slot_id JOIN subjects su ON su.id=ts.subject_id
           JOIN student_profiles sp ON sp.student_id=ca.student_id AND sp.enrollment_status='approved'
-          JOIN teaching_assignments a ON a.section_id=ts.section_id JOIN teacher_profiles tp ON tp.department_id=? AND tp.user_id=a.teacher_id
+          WHERE EXISTS (SELECT 1 FROM teaching_assignments a
+            JOIN teacher_profiles tp ON tp.user_id=a.teacher_id
+            WHERE a.section_id=ts.section_id AND tp.department_id=?)
           GROUP BY ts.section_id,su.id""",(dept["id"],)).fetchall()
         result=[]
         for r in rows:
             strength=db.execute("SELECT COUNT(*) FROM student_profiles WHERE section_id=? AND enrollment_status='approved'",(r["section_id"],)).fetchone()[0]
-            complete=bool(strength and r["sessions"] and r["marked"] >= strength*r["sessions"])
             at_risk=None
-            if complete:
-                per_student=db.execute("""SELECT student_id,COUNT(*) held,
+            if r["sessions"]:
+                per_student=db.execute("""SELECT ca.student_id,COUNT(*) held,
                   SUM(status IN ('present','late')) attended,SUM(status='excused') excused
-                  FROM class_attendance ca JOIN timetable_slots ts ON ts.id=ca.slot_id
+                  FROM class_attendance ca JOIN attendance_sessions ses
+                    ON ses.slot_id=ca.slot_id AND ses.date=ca.date
+                  JOIN timetable_slots ts ON ts.id=ca.slot_id
                   JOIN student_profiles sp ON sp.student_id=ca.student_id AND sp.enrollment_status='approved'
-                  WHERE ts.section_id=? AND ts.subject_id=? GROUP BY student_id""",(r["section_id"],r["subject_id"])).fetchall()
+                  WHERE ts.section_id=? AND ts.subject_id=? AND EXISTS (
+                    SELECT 1 FROM teaching_assignments a JOIN teacher_profiles tp ON tp.user_id=a.teacher_id
+                    WHERE a.section_id=ts.section_id AND tp.department_id=?)
+                  GROUP BY ca.student_id""",(r["section_id"],r["subject_id"],dept["id"])).fetchall()
                 at_risk=sum(1 for student in per_student if student["held"]>student["excused"] and
                   student["attended"]/(student["held"]-student["excused"]) < ATTENDANCE_THRESHOLD/100)
             result.append({"sectionId":r["section_id"],"subjectCode":r["code"],"subjectName":r["name"],
-              "sessionsHeld":r["sessions"],"presentRate":round(100*r["present"]/r["marked"],1) if complete else None,
+              "sessionsHeld":r["sessions"],"presentRate":round(100*r["present"]/(r["marked"]-r["excused"]),1) if r["marked"]>r["excused"] else None,
               "atRiskCount":at_risk,"strength":strength})
         return result
 

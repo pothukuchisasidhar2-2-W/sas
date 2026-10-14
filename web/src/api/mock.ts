@@ -32,6 +32,7 @@ import { DEMO_PASSWORD, createSeedDatabase, toIsoDate, addDays } from "./seed";
 import type { MemberRecord, MockUser, SeedDatabase } from "./seed";
 import type {
   AttendanceRecord,
+  AttendanceSessionState,
   AttendanceStatus,
   ClassAttendanceRow,
   Department,
@@ -45,6 +46,7 @@ import type {
   StudentProfile,
   Subject,
   SubjectAttendanceSummary,
+  TimetableChangeInput,
   TeacherProfile,
   TimetableSlot,
   TodayEntry,
@@ -64,12 +66,37 @@ interface Persisted {
   posts: DeptPost[];
   replies?: DeptReply[];
   attendanceOverrides: AttendanceRecord[];
+  timetableChanges?: SavedTimetableChange[];
+  completedSessions?: string[];
+}
+
+interface SavedTimetableChange extends TimetableChangeInput {
+  id: string;
+  addedSlot?: TimetableSlot;
+  cancelled?: boolean;
 }
 
 /** The live in-memory database: generated history + persisted mutations. */
 let db: SeedDatabase;
 let attendanceOverrides: AttendanceRecord[] = [];
 let replies: DeptReply[] = [];
+let timetableChanges: SavedTimetableChange[] = [];
+let completedSessions = new Set<string>();
+
+function attendanceSessionKey(sectionId: string, date: string, slotId: string) {
+  return `${sectionId}|${date}|${slotId}`;
+}
+
+function seedCompletedSessions(): Set<string> {
+  const now = new Date();
+  const today = toIsoDate(now);
+  const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  return new Set(db.attendance.flatMap((record) => {
+    const slot = db.slots.find((item) => item.id === record.slotId);
+    if (!slot || (record.date === today && slot.endTime > currentTime) || record.date > today) return [];
+    return [attendanceSessionKey(record.sectionId, record.date, record.slotId)];
+  }));
+}
 
 function loadPersisted(): Persisted | null {
   try {
@@ -94,6 +121,8 @@ function persist() {
     posts: db.posts,
     replies,
     attendanceOverrides,
+    timetableChanges,
+    completedSessions: [...completedSessions],
   };
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -106,6 +135,8 @@ function init() {
   db = createSeedDatabase();
   attendanceOverrides = [];
   replies = [];
+  timetableChanges = [];
+  completedSessions = new Set();
   const saved = loadPersisted();
   if (saved) {
     db.users = saved.users;
@@ -119,6 +150,8 @@ function init() {
     db.posts = saved.posts;
     replies = saved.replies ?? [];
     attendanceOverrides = saved.attendanceOverrides ?? [];
+    timetableChanges = saved.timetableChanges ?? [];
+    completedSessions = new Set(saved.completedSessions ?? []);
   }
   for (const record of attendanceOverrides) {
     const index = db.attendance.findIndex((r) => r.id === record.id);
@@ -137,6 +170,7 @@ function init() {
     seen.add(key);
     return true;
   });
+  if (!saved?.completedSessions) completedSessions = seedCompletedSessions();
 }
 
 init();
@@ -220,6 +254,31 @@ function assertSectionInScope(token: string, sectionId: string) {
     fail(403, "You are not assigned to that class.");
   }
   return user.profile;
+}
+
+function effectiveSchedule(sectionId: string, date: string): TimetableSlot[] {
+  const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
+  const changes = timetableChanges.filter((change) => change.sectionId === sectionId && change.date === date);
+  const result = db.slots
+    .filter((slot) => slot.sectionId === sectionId && slot.dayOfWeek === dayOfWeek)
+    .flatMap((slot) => {
+      const change = changes.find((item) => item.slotId === slot.id && item.kind !== "add");
+      if (change?.kind === "cancel") return [];
+      if (change?.kind === "modify") {
+        return [{
+          ...slot,
+          startTime: change.startTime ?? slot.startTime,
+          endTime: change.endTime ?? slot.endTime,
+          room: change.room ?? slot.room,
+          dateChange: "modified" as const,
+        }];
+      }
+      return [slot];
+    });
+  result.push(...changes.flatMap((change) => change.kind === "add" && !change.cancelled && change.addedSlot ? [
+    { ...change.addedSlot, dateChange: "added" as const },
+  ] : []));
+  return result.sort((left, right) => left.startTime.localeCompare(right.startTime));
 }
 
 /** Narrow a stored membership down to the public shape the API exposes. */
@@ -337,7 +396,7 @@ export const mockApi: Api = {
       // A new teacher is deliberately NOT in a department: they must either
       // create one (becoming HOD) or join an existing one with a code.
       departmentId: null,
-      departmentName: input.departmentName || null,
+      departmentName: null,
       isHod: false,
       assignments: input.assignments.map((a, index) => ({
         id: `asg-${userId}-${index}`,
@@ -398,6 +457,7 @@ export const mockApi: Api = {
     const summaries = new Map<string, SubjectAttendanceSummary>();
     for (const record of db.attendance) {
       if (record.studentId !== user.profile.studentId) continue;
+      if (!completedSessions.has(attendanceSessionKey(record.sectionId, record.date, record.slotId))) continue;
       const subject = db.subjects.find((s) => s.id === record.subjectId);
       const key = record.subjectId;
       if (!summaries.has(key)) {
@@ -438,10 +498,7 @@ export const mockApi: Api = {
     const user = currentUser(token);
     if (user.role !== "student") fail(403, "Students only.");
 
-    const dow = new Date(`${date}T00:00:00`).getDay();
-    const daySlots = db.slots
-      .filter((s) => s.sectionId === user.profile.sectionId && s.dayOfWeek === dow)
-      .sort((a, b) => a.startTime.localeCompare(b.startTime));
+    const daySlots = effectiveSchedule(user.profile.sectionId, date);
 
     return daySlots.map<TodayEntry>((slot) => {
       const record =
@@ -467,7 +524,8 @@ export const mockApi: Api = {
     if (user.role !== "student") fail(403, "Students only.");
     return db.attendance
       .filter(
-        (r) => r.studentId === user.profile.studentId && r.date >= from && r.date <= to,
+        (r) => r.studentId === user.profile.studentId && r.date >= from && r.date <= to
+          && (!r.slotId || completedSessions.has(attendanceSessionKey(r.sectionId, r.date, r.slotId))),
       )
       .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.slotId.localeCompare(a.slotId)));
   },
@@ -500,15 +558,20 @@ export const mockApi: Api = {
   async teacherRoster(token, params) {
     await net();
     assertSectionInScope(token, params.sectionId);
+    const cancelled = timetableChanges.some((change) =>
+      change.date === params.date && change.sectionId === params.sectionId
+      && change.slotId === params.slotId
+      && (change.kind === "cancel" || (change.kind === "add" && change.cancelled)),
+    );
+    if (cancelled) fail(409, "This period was cancelled for that date.");
 
     const roster = db.students.filter((s) => s.sectionId === params.sectionId);
-    const daySlots = db.slots
-      .filter((s) => s.sectionId === params.sectionId)
-      .filter((s) => s.dayOfWeek === new Date(`${params.date}T00:00:00`).getDay());
+    const daySlots = effectiveSchedule(params.sectionId, params.date);
 
     const relevant = params.slotId
       ? daySlots.filter((s) => s.id === params.slotId)
       : daySlots;
+    if (params.slotId && relevant.length === 0) fail(404, "Period is not scheduled for that class and date.");
     const slotIds = new Set(relevant.map((s) => s.id));
 
     return roster
@@ -561,13 +624,25 @@ export const mockApi: Api = {
     await net();
     assertSectionInScope(token, input.sectionId);
     const user = currentUser(token);
-    const userId = user.role === "teacher" ? user.profile.userId : null;
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    if (input.date > toIsoDate(new Date())) fail(422, "Attendance cannot be marked for a future date.");
+    if (timetableChanges.some((change) => change.date === input.date && change.slotId === input.slotId
+      && (change.kind === "cancel" || (change.kind === "add" && change.cancelled)))) {
+      fail(409, "This period was cancelled for that date.");
+    }
+    const userId = user.profile.userId;
 
     const id = `att-${input.date}-${input.slotId}-${input.studentId}`;
+    const scheduledSlot = effectiveSchedule(input.sectionId, input.date).find((s) => s.id === input.slotId);
+    if (!scheduledSlot) fail(404, "Period not found for that date.");
+    if (scheduledSlot.teacherId !== user.profile.userId) fail(403, "Only the teacher scheduled for this period can mark attendance.");
+    const student = db.students.find((item) => item.studentId === input.studentId && item.sectionId === input.sectionId);
+    if (!student) fail(404, "Student is not in this class.");
+    if (student.enrollmentStatus !== "approved") fail(409, "Approve the student's class membership before marking attendance.");
     const record: AttendanceRecord = {
       id,
       studentId: input.studentId,
-      subjectId: db.slots.find((s) => s.id === input.slotId)?.subjectId ?? "UNKNOWN",
+      subjectId: scheduledSlot.subjectId,
       slotId: input.slotId,
       sectionId: input.sectionId,
       date: input.date,
@@ -595,27 +670,80 @@ export const mockApi: Api = {
     return record;
   },
 
+  async attendanceSession(token, params): Promise<AttendanceSessionState> {
+    await net();
+    assertSectionInScope(token, params.sectionId);
+    const scheduled = effectiveSchedule(params.sectionId, params.date)
+      .some((slot) => slot.id === params.slotId);
+    if (!scheduled) fail(404, "Period is not scheduled for that class and date.");
+    return {
+      completed: completedSessions.has(attendanceSessionKey(params.sectionId, params.date, params.slotId)),
+      completedAt: null,
+      cameraSession: false,
+    };
+  },
+
+  async completeAttendanceSession(token, input) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    assertSectionInScope(token, input.sectionId);
+    if (input.date > toIsoDate(new Date())) fail(422, "A future period cannot be completed.");
+    const scheduled = effectiveSchedule(input.sectionId, input.date)
+      .find((slot) => slot.id === input.slotId);
+    if (!scheduled) fail(404, "Period is not scheduled for that class and date.");
+    if (scheduled.teacherId !== user.profile.userId) fail(403, "Only the teacher scheduled for this period can complete attendance.");
+    const key = attendanceSessionKey(input.sectionId, input.date, input.slotId);
+    if (completedSessions.has(key)) return { completed: true, completedAt: null, absencesAdded: 0, reviewRequired: 0 };
+
+    let absencesAdded = 0;
+    for (const student of db.students.filter((item) =>
+      item.sectionId === input.sectionId && item.enrollmentStatus === "approved",
+    )) {
+      const id = `att-${input.date}-${input.slotId}-${student.studentId}`;
+      if (db.attendance.some((record) => record.id === id)) continue;
+      const absence: AttendanceRecord = {
+        id,
+        studentId: student.studentId,
+        subjectId: scheduled.subjectId,
+        slotId: input.slotId,
+        sectionId: input.sectionId,
+        date: input.date,
+        status: "absent",
+        inTime: null,
+        outTime: null,
+        method: "manual",
+        markedBy: user.profile.userId,
+      };
+      db.attendance.push(absence);
+      attendanceOverrides.push(absence);
+      absencesAdded += 1;
+    }
+    completedSessions.add(key);
+    persist();
+    return { completed: true, completedAt: null, absencesAdded, reviewRequired: 0 };
+  },
+
   async teacherSchedule(token, date) {
     await net();
     const user = currentUser(token);
     if (user.role !== "teacher") fail(403, "Teachers only.");
-    const dow = new Date(`${date}T00:00:00`).getDay();
 
     if (user.profile.isHod && user.profile.departmentId) {
       const deptSections = new Set(
         sectionOptionsForTeacher(user.profile).map((s) => s.id),
       );
-      return db.slots
-        .filter((s) => s.dayOfWeek === dow && deptSections.has(s.sectionId))
+      return [...deptSections].flatMap((sectionId) => effectiveSchedule(sectionId, date))
         .sort((a, b) => a.startTime.localeCompare(b.startTime));
     }
 
-    return db.slots
-      .filter((s) => s.dayOfWeek === dow && s.teacherId === user.profile.userId)
+    return [...new Set(user.profile.assignments.map((assignment) => assignment.sectionId))]
+      .flatMap((sectionId) => effectiveSchedule(sectionId, date))
+      .filter((slot) => slot.teacherId === user.profile.userId)
       .sort((a, b) => a.startTime.localeCompare(b.startTime));
   },
 
-  async sectionTimetable(token, sectionId) {
+  async sectionTimetable(token, sectionId, date) {
     await net();
     const user = currentUser(token);
     if (user.role === "student") {
@@ -626,13 +754,127 @@ export const mockApi: Api = {
     } else {
       assertSectionInScope(token, sectionId);
     }
-    return db.slots
-      .filter((s) => s.sectionId === sectionId)
-      .sort((a, b) =>
-        a.dayOfWeek === b.dayOfWeek
-          ? a.startTime.localeCompare(b.startTime)
-          : a.dayOfWeek - b.dayOfWeek,
+    if (date) return effectiveSchedule(sectionId, date);
+    return db.slots.filter((s) => s.sectionId === sectionId).sort((a, b) =>
+      a.dayOfWeek === b.dayOfWeek
+        ? a.startTime.localeCompare(b.startTime)
+        : a.dayOfWeek - b.dayOfWeek,
+    );
+  },
+
+  async previewTimetableChange(token, input) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    assertSectionInScope(token, input.sectionId);
+    if (!user.profile.assignments.some((a) => a.sectionId === input.sectionId)) {
+      fail(403, "You can only change a class you are assigned to teach.");
+    }
+    if (input.date < new Date().toISOString().slice(0, 10)) {
+      fail(422, "Timetable changes can only be published for today or a future date.");
+    }
+    const dayOfWeek = new Date(`${input.date}T00:00:00`).getDay();
+    if (dayOfWeek === 0) fail(422, "Timetable changes are only available Monday through Saturday.");
+    const existingChange = timetableChanges.find((change) =>
+      change.date === input.date && change.slotId === input.slotId,
+    );
+    const cancellingExtra = input.kind === "cancel" && existingChange?.kind === "add";
+    if (cancellingExtra && existingChange?.cancelled) {
+      fail(409, "This extra period has already been cancelled.");
+    }
+    let slot: TimetableSlot;
+    if (input.kind === "cancel" || input.kind === "modify") {
+      const recurring = db.slots.find((s) => s.id === input.slotId && s.sectionId === input.sectionId && s.dayOfWeek === dayOfWeek);
+      const base = cancellingExtra ? existingChange?.addedSlot : recurring;
+      if (!base) fail(404, "That recurring period is not on the selected date.");
+      if (existingChange?.kind === "add" && input.kind !== "cancel") {
+        fail(404, "Only an extra period can be cancelled, not edited as a recurring period.");
+      }
+      if (!user.profile.assignments.some((a) => a.sectionId === input.sectionId && a.subjectId === base.subjectId)) {
+        fail(403, "You can only change a period for a subject you are assigned to teach.");
+      }
+      slot = input.kind === "modify"
+        ? {
+            ...base,
+            startTime: parseTime(input.startTime ?? "") ?? base.startTime,
+            endTime: parseTime(input.endTime ?? "") ?? base.endTime,
+            room: input.room ?? base.room,
+            dateChange: "modified",
+          }
+        : base;
+    } else {
+      const assignment = user.profile.assignments.find((a) =>
+        a.sectionId === input.sectionId && a.subjectId === input.subjectId,
       );
+      if (!assignment) fail(403, "Choose a subject assigned to you for this class.");
+      const startTime = parseTime(input.startTime ?? "");
+      const endTime = parseTime(input.endTime ?? "");
+      if (!startTime || !endTime || endTime <= startTime) fail(422, "Enter a valid start and end time in 24-hour HH:MM format.");
+      slot = {
+        id: `preview-${input.date}-${input.sectionId}-${startTime}`,
+        sectionId: input.sectionId,
+        subjectId: assignment.subjectId,
+        teacherId: user.profile.userId,
+        dayOfWeek,
+        startTime,
+        endTime,
+        room: input.room ?? "",
+        dateChange: "added",
+      };
+      const reservedStart = db.slots.some((item) =>
+        item.sectionId === input.sectionId && item.dayOfWeek === dayOfWeek && item.startTime === startTime,
+      ) || timetableChanges.some((change) =>
+        change.sectionId === input.sectionId && change.addedSlot?.dayOfWeek === dayOfWeek
+        && change.addedSlot.startTime === startTime,
+      );
+      if (reservedStart) {
+        fail(409, "That start time is already reserved by a recurring or previously used period. Choose another start time.");
+      }
+    }
+    if (input.kind !== "cancel") {
+      const others = effectiveSchedule(input.sectionId, input.date).filter((item) => item.id !== input.slotId);
+      const conflict = others.find((item) =>
+        slot.startTime < item.endTime && slot.endTime > item.startTime,
+      );
+      if (conflict) fail(409, `This change overlaps another period (${conflict.startTime}–${conflict.endTime}).`);
+      for (const sectionId of new Set(user.profile.assignments.map((a) => a.sectionId))) {
+        if (sectionId === input.sectionId) continue;
+        const teacherConflict = effectiveSchedule(sectionId, input.date).find((item) =>
+          item.teacherId === user.profile.userId
+          && slot.startTime < item.endTime && slot.endTime > item.startTime,
+        );
+        if (teacherConflict) fail(409, `This change conflicts with your other class (${sectionId}, ${teacherConflict.startTime}–${teacherConflict.endTime}).`);
+      }
+    }
+    return { kind: input.kind, date: input.date, slot };
+  },
+
+  async createTimetableChange(token, input) {
+    await net();
+    const preview = await this.previewTimetableChange(token, input);
+    const id = `change-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const existing = timetableChanges.find((change) =>
+      change.date === input.date && change.slotId === input.slotId,
+    );
+    if (input.kind === "cancel" && existing?.kind === "add") {
+      existing.cancelled = true;
+      persist();
+      return { message: "Extra period cancelled for this date." };
+    }
+    const addedSlot = input.kind === "add"
+      ? { ...preview.slot, id: `slot-${id}` }
+      : undefined;
+    const nextChange: SavedTimetableChange = {
+      ...input,
+      id: existing?.id ?? id,
+      slotId: input.kind === "add" ? addedSlot?.id : input.slotId,
+      addedSlot: existing?.addedSlot ?? addedSlot,
+      cancelled: false,
+    };
+    if (existing && existing.kind !== "add") Object.assign(existing, nextChange);
+    else timetableChanges.push(nextChange);
+    persist();
+    return { message: "Date-specific timetable change published." };
   },
 
   async uploadTimetable(token, input) {
@@ -1025,9 +1267,10 @@ export const mockApi: Api = {
       );
       for (const subjectId of subjectIds) {
         const records = db.attendance.filter(
-          (r) => r.sectionId === section.id && r.subjectId === subjectId,
+          (r) => r.sectionId === section.id && r.subjectId === subjectId
+            && completedSessions.has(attendanceSessionKey(r.sectionId, r.date, r.slotId)),
         );
-        const sessionKeys = new Set(records.map((r) => r.date));
+        const sessionKeys = new Set(records.map((r) => `${r.date}|${r.slotId}`));
         let counted = 0;
         let attended = 0;
         let atRisk = 0;

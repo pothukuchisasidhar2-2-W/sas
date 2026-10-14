@@ -1,470 +1,309 @@
+"""Timetable-aware attendance capture from USB, IP CCTV, or video sources."""
+
+from __future__ import annotations
+
+import argparse
+import os
 import sys
+import time as monotonic_time
+from collections import defaultdict
+from datetime import datetime, time, timedelta
 from pathlib import Path
 
 import cv2
-import sqlite3
 import numpy as np
-from datetime import datetime
 
-# Same repo-root anchoring as register.py so the script works from any cwd.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-YUNET_MODEL = str(PROJECT_ROOT / "models" / "face_detection_yunet_2026may.onnx")
-SFACE_MODEL = str(PROJECT_ROOT / "models" / "face_recognition_sface_2021dec.onnx")
-DB_PATH = str(PROJECT_ROOT / "attendance.db")
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Sibling module (scripts/core/ref_store.py) holds the harvest policy and
-# the vectorized matcher; running this file as a script puts its directory
-# on sys.path already, but be explicit so `python -m` works too.
+from api import main as api
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ref_store
 
+YUNET_MODEL = PROJECT_ROOT / "models" / "face_detection_yunet_2026may.onnx"
+SFACE_MODEL = PROJECT_ROOT / "models" / "face_recognition_sface_2021dec.onnx"
 
 
-# ---------------------------------------------------------------------------
-# Match settings
-# ---------------------------------------------------------------------------
-MATCH_THRESHOLD = 0.363            # cosine-score threshold for a 'recognized' face
-# Update this only alongside any server-side retraining; do NOT raise it
-# speculation without looking at real unseen faces. The first convincing
-# hard case should drive the change, not a single live demo.
+def parse_source(value: str) -> int | str:
+    """Convert numeric camera indexes while leaving stream URLs and file paths intact."""
+    stripped = value.strip()
+    if stripped.lstrip("-").isdigit():
+        return int(stripped)
+    return stripped
 
 
+def options() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Record timetable-linked student recognition events from a camera stream.",
+    )
+    parser.add_argument(
+        "--source",
+        default=os.environ.get("TRUE_EYE_CAMERA_SOURCE", "0"),
+        help="OpenCV camera index, RTSP/HTTP stream URL, or video path (default: env or 0).",
+    )
+    parser.add_argument(
+        "--section-id",
+        default=os.environ.get("TRUE_EYE_CAMERA_SECTION", ""),
+        help="Class section this camera serves, e.g. CSE-2-A (required).",
+    )
+    parser.add_argument(
+        "--camera-id",
+        default=os.environ.get("TRUE_EYE_CAMERA_ID", "camera-1"),
+        help="Stable, non-secret identifier for this camera.",
+    )
+    parser.add_argument(
+        "--event-type",
+        choices=("entry", "exit"),
+        default=os.environ.get("TRUE_EYE_CAMERA_EVENT_TYPE", "entry"),
+        help="Whether the camera watches the classroom entrance or exit.",
+    )
+    parser.add_argument(
+        "--db-path",
+        default=os.environ.get("TRUE_EYE_DB", str(PROJECT_ROOT / "attendance.db")),
+        help="Shared SQLite database path (default: TRUE_EYE_DB or attendance.db).",
+    )
+    parser.add_argument(
+        "--late-grace-minutes",
+        type=int,
+        default=int(os.environ.get("TRUE_EYE_LATE_GRACE_MINUTES", "10")),
+    )
+    parser.add_argument(
+        "--early-exit-review-minutes",
+        type=int,
+        default=int(os.environ.get("TRUE_EYE_EARLY_EXIT_REVIEW_MINUTES", "5")),
+    )
+    parser.add_argument("--sample-interval", type=float, default=0.5,
+                        help="Seconds between recognition samples.")
+    parser.add_argument("--confirm-hits", type=int, default=2,
+                        help="Sampled matches within the confirmation window needed to accept an event.")
+    parser.add_argument("--confirm-window", type=float, default=5.0,
+                        help="Seconds allowed between confirmation samples.")
+    parser.add_argument("--reconnect-delay", type=float, default=2.0)
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=float(os.environ.get("TRUE_EYE_FACE_MATCH_THRESHOLD", "0.363")),
+    )
+    parser.add_argument("--headless", action="store_true",
+                        help="Disable the preview window for a service or headless host.")
+    args = parser.parse_args()
+    if not args.section_id.strip():
+        parser.error("set --section-id or TRUE_EYE_CAMERA_SECTION")
+    if not args.camera_id.strip():
+        parser.error("--camera-id cannot be empty")
+    if args.late_grace_minutes < 0 or args.early_exit_review_minutes < 0:
+        parser.error("grace periods cannot be negative")
+    if args.sample_interval <= 0 or args.confirm_window <= 0 or args.reconnect_delay <= 0:
+        parser.error("sampling, confirmation, and reconnect intervals must be positive")
+    if args.confirm_hits < 1:
+        parser.error("--confirm-hits must be at least 1")
+    if not 0 <= args.match_threshold <= 1:
+        parser.error("--match-threshold must be between 0 and 1")
+    args.source = parse_source(args.source)
+    args.section_id = args.section_id.strip()
+    args.camera_id = args.camera_id.strip()
+    return args
 
-# -----------------------------
-# Face Detector
-# -----------------------------
-detector = cv2.FaceDetectorYN.create(
-    YUNET_MODEL,
-    "",
-    (320, 320),
-    0.8,
-    0.3,
-    5000
-)
+
+def active_slot(section_id: str, event_type: str, now: datetime) -> dict | None:
+    with api.connect() as db:
+        slots = api.effective_section_schedule(db, section_id, now.date())
+    current = now.replace(tzinfo=None)
+    for slot in slots:
+        start = datetime.combine(now.date(), time.fromisoformat(slot["startTime"]))
+        end = datetime.combine(now.date(), time.fromisoformat(slot["endTime"]))
+        if event_type == "exit":
+            end += timedelta(minutes=5)
+        if start <= current <= end:
+            return slot
+    return None
 
 
+def load_registered_students(section_id: str) -> tuple[list, dict[str, str]]:
+    with api.connect() as db:
+        rows = db.execute("""SELECT s.student_id,s.name,s.embedding
+            FROM students s JOIN student_profiles p ON p.student_id=s.student_id
+            WHERE p.section_id=? AND p.enrollment_status='approved'
+            ORDER BY s.student_id""", (section_id,)).fetchall()
+        references = ref_store.load_all_references(db)
 
-# -----------------------------
-# Face Recognizer
-# -----------------------------
-recognizer = cv2.FaceRecognizerSF.create(
-    SFACE_MODEL,
-    ""
-)
-
-
-
-# ---------------------------------------------------------------------------
-# Sharing SQLite across threads/processes is the #1 source of weird sqlite3
-# errors on these machines, including the multisetbuffer message browsers
-# surface when several clients write at once. Keep the DB tidy with WAL mode
-# and a busy timeout so a slow writer does not hard-fail the recognizer.
-# ---------------------------------------------------------------------------
-def open_db():
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
-
-def _refresh_student_rows(conn, student_id, name, rows):
-    """Rebuild the matching rows for one student from the database.
-
-    Called after a harvest so a new reference starts matching immediately
-    without restarting the process.
-    """
-    rows = [row for row in rows if row[0] != student_id]
-
-    primary = conn.execute(
-        "SELECT embedding FROM students WHERE student_id = ?",
-        (student_id,),
-    ).fetchone()
-    if primary is None:
-        return rows
-
-    rows.append(ref_store.as_match_rows(
-        student_id, name, np.frombuffer(primary[0], dtype=np.float32)
-    ))
-    for vector in ref_store.load_student_references(conn, student_id):
-        rows.append(ref_store.as_match_rows(student_id, name, vector))
-    return rows
+    names: dict[str, str] = {}
+    match_rows = []
+    for row in rows:
+        vector = np.frombuffer(row["embedding"], dtype=np.float32)
+        if vector.size == 0:
+            continue
+        names[row["student_id"]] = row["name"]
+        match_rows.append(ref_store.as_match_rows(row["student_id"], row["name"], vector))
+    for student_id, vector in references:
+        if student_id in names:
+            match_rows.append(ref_store.as_match_rows(student_id, names[student_id], vector))
+    if not match_rows:
+        raise RuntimeError("This section has no approved students with enrolled face data.")
+    return match_rows, names
 
 
+def open_source(source: int | str) -> cv2.VideoCapture:
+    capture = cv2.VideoCapture(source, cv2.CAP_ANY)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
 
-# ---------------------------------------------------------------------------
-# Initial database setup. The legacy schema only keyed attendance by
-# student_id + date, which lets two concurrent runs or a re-run mark the
-# same person twice. We add a uniqueness constraint, but because SQLite
-# cannot ALTER a table into a UNIQUE constraint easily, the constraint is
-# first enforced at the application layer here. The staging site should
-# `database.py` IS the source of truth for schema migrations.
-# ---------------------------------------------------------------------------
-def _ensure_attendance_uniqueness_constraint(conn):
-    """If a UNIQUE constraint is missing on (student_id, date), add a
-    runtime guard so duplicate inserts do not happen. The persisted schema
-    should be migrated properly through database.py, but until that is wired
-    into every entry point, this prevents the most common duplicate case.
-    """
-    cur = conn.cursor()
-    cur.execute("PRAGMA table_info(attendance)")
-    present = {row[1] for row in cur.fetchall()}
 
-    if not ({"student_id", "date"} <= present):
-        return
+def run() -> None:
+    args = options()
+    api.DB_PATH = Path(args.db_path).expanduser().resolve()
+    api.init_db()
 
-    # Detecting the exact absence of a unique index in SQLite is best done
-    # by querying sqlite_master, not by guessing names.
-    cur.execute("""
-        SELECT 1 FROM sqlite_master
-        WHERE type='index' AND name='attendance_student_date_unique'
-        LIMIT 1
-    """)
-    if cur.fetchone() is not None:
-        return
+    if not YUNET_MODEL.is_file() or not SFACE_MODEL.is_file():
+        raise FileNotFoundError("The YuNet and SFace model files are required in the models directory.")
 
-    connection = conn
-    cur = conn.cursor()
+    registered_students, names = load_registered_students(args.section_id)
+    detector = cv2.FaceDetectorYN.create(
+        str(YUNET_MODEL), "", (320, 320), 0.8, 0.3, 5000,
+    )
+    recognizer = cv2.FaceRecognizerSF.create(str(SFACE_MODEL), "")
+    capture = open_source(args.source)
+    if not capture.isOpened():
+        print("Camera source is not open yet; the service will keep retrying.")
+
+    print(f"Loaded {len(names)} approved face profile(s) for {args.section_id}.")
+    print(f"Listening for {args.event_type} events from camera {args.camera_id}.")
+    print("Unobserved students and early exits are sent for teacher review, not auto-marked absent.")
+    if args.headless:
+        print("Headless mode: stop with Ctrl+C.")
+    else:
+        print("Press Q in the preview window to stop.")
+
+    candidate_hits: dict[str, int] = defaultdict(int)
+    last_hit: dict[str, float] = {}
+    recorded: set[tuple[str, str]] = set()
+    current_slot_id: str | None = None
+    last_heartbeat = 0.0
+    next_sample = 0.0
+    next_schedule_check = 0.0
+    slot_cache: dict | None = None
+    last_capture_failure = 0.0
+    harvest = ref_store.HarvestState()
     try:
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            attendance_student_date_unique
-            ON attendance(student_id, date)
-        """)
-    except sqlite3.OperationalError:
-        # SQLite will raise if the raw DB file does not allow unique
-        # indexes on the existing rows; ignore here and rely on the
-        # app-layer guard in the main loop.
-        pass
-
-
-
-# -----------------------------
-# Load students from database
-# -----------------------------
-
-
-
-connection = open_db()
-cursor = connection.cursor()
-
-# SQLite journal mode is set inside open_db(); read it back for the log.
-cursor.execute("PRAGMA journal_mode=WAL")
-print("SQLite journal mode:", cursor.fetchone()[0])
-
-_ensure_attendance_uniqueness_constraint(connection)
-
-# Make sure the reference-harvesting table exists even on databases that
-# were created before this feature (idempotent, safe to run every startup).
-ref_store.ensure_schema(connection)
-
-cursor.execute("""
-    SELECT student_id, name, embedding
-    FROM students
-""")
-
-students = cursor.fetchall()
-
-if not students:
-    print("No registered students found!")
-    raise SystemExit()
-
-
-
-registered_students = []
-names = {}
-
-for student_id, name, embedding_bytes in students:
-
-    embedding = np.frombuffer(
-        embedding_bytes,
-        dtype=np.float32
-    ).reshape(1, -1)
-
-    # Server-side and recognition-time matching both normalize before
-    # cosine comparison, so normalize once here as well for consistency.
-    norm = float(np.linalg.norm(embedding, ord=2))
-    if norm > 0:
-        embedding = embedding / norm
-
-    names[student_id] = name
-    registered_students.append(
-        ref_store.as_match_rows(student_id, name, embedding)
-    )
-
-
-
-# Previously harvested reference views (extra poses/lighting captured in
-# earlier runs). They match exactly like the registration embedding.
-reference_count = 0
-for student_id, ref_vector in ref_store.load_all_references(connection):
-    if student_id in names:
-        registered_students.append(
-            ref_store.as_match_rows(student_id, names[student_id], ref_vector)
-        )
-        reference_count += 1
-
-
-
-harvest = ref_store.HarvestState()
-
-print(
-    f"{len(names)} student(s) loaded "
-    f"({reference_count} extra reference embedding(s))."
-)
-print("Starting live recognition...")
-print("Attendance system active.")
-print("Press Q to quit.")
-
-
-
-# -----------------------------
-# Camera
-# -----------------------------
-camera = cv2.VideoCapture(0)
-
-if not camera.isOpened():
-    print("Camera could not open.")
-    raise SystemExit()
-
-
-
-# ---------------------------------------------------------------------------
-# Track per-student state across the live loop so a single correctly matched
-# frame does not immediately re-insert a row that already exists. This holds
-# until the next explicit restart of the session; on the real backend, this
-# role is played by the session model and per-session upsert.
-# ---------------------------------------------------------------------------
-marked_today = set()
-
-
-
-# -----------------------------
-# Live Recognition
-# -----------------------------
-while True:
-
-    success, frame = camera.read()
-
-    if not success:
-        print("Could not read camera.")
-        break
-
-
-
-    height, width = frame.shape[:2]
-
-    detector.setInputSize((width, height))
-
-    _, faces = detector.detect(frame)
-
-
-
-    if faces is not None:
-
-        for face in faces:
-
-            x, y, w, h = map(int, face[:4])
-
-
-
-            # -----------------------------
-            # Generate live embedding
-            # -----------------------------
-            aligned_face = recognizer.alignCrop(
-                frame,
-                face
-            )
-
-            live_embedding = recognizer.feature(
-                aligned_face
-            )
-
-
-
-            # -----------------------------
-            # Find best student
-            # -----------------------------
-            # One vectorized cosine against every stored embedding (the
-            # registration one plus any harvested references) instead of a
-            # per-student cv2.match() call.
-            best_score, student_id, name = ref_store.best_match(
-                registered_students,
-                live_embedding
-            )
-
-            best_student = (student_id, name) if best_score >= 0 else None
-
-
-
-            # -----------------------------
-            # Recognized
-            # -----------------------------
-            if best_score >= MATCH_THRESHOLD:
-
-                label = f"{name} ({student_id})"
-
-                box_color = (0, 255, 0)
-
-                now = datetime.now()
-
-                today = now.strftime("%Y-%m-%d")
-                current_time = now.strftime("%H:%M:%S")
-
-
-
-                # -----------------------------
-                # Harvest a new reference view
-                # -----------------------------
-                # Independent of attendance marking: a confident, *different*
-                # view of an already-marked student is still worth keeping.
-                # ref_store decides (score gate, cooldown, redundancy, cap).
-                action, _new_vector = harvest.maybe_store(
-                    connection,
-                    student_id,
-                    live_embedding,
-                    best_score,
-                )
-
-                if action:
-                    registered_students = _refresh_student_rows(
-                        connection, student_id, name, registered_students
+        while True:
+            now_monotonic = monotonic_time.monotonic()
+            now = datetime.now().astimezone().replace(microsecond=0)
+            if now_monotonic >= next_schedule_check:
+                slot_cache = active_slot(args.section_id, args.event_type, now)
+                next_schedule_check = now_monotonic + 1.0
+            slot = slot_cache
+            slot_key = slot["id"] if slot else None
+            if slot_key != current_slot_id:
+                candidate_hits.clear()
+                last_hit.clear()
+                current_slot_id = slot_key
+                last_heartbeat = 0.0
+
+            if slot is not None and now_monotonic - last_heartbeat >= 15:
+                with api.connect() as db:
+                    api.record_camera_run(
+                        db, args.section_id, slot["id"], now.date(),
+                        args.camera_id, args.event_type, now,
                     )
-                    stored = len(
-                        ref_store.load_student_references(connection, student_id)
-                    )
-                    print(
-                        f"REFERENCE {action.upper()}: {name} ({student_id}) "
-                        f"[{stored}/{ref_store.MAX_REFERENCES} stored]"
-                    )
+                last_heartbeat = now_monotonic
 
+            success, frame = capture.read()
+            if not success:
+                if now_monotonic - last_capture_failure >= 10:
+                    print("Camera feed unavailable; attendance will not be inferred from missing frames.")
+                    last_capture_failure = now_monotonic
+                capture.release()
+                monotonic_time.sleep(args.reconnect_delay)
+                capture = open_source(args.source)
+                continue
 
+            if slot is not None and now_monotonic >= next_sample:
+                next_sample = now_monotonic + args.sample_interval
+                height, width = frame.shape[:2]
+                detector.setInputSize((width, height))
+                _, faces = detector.detect(frame)
+                hit_this_sample: dict[str, float] = {}
+                if faces is not None:
+                    for face in faces:
+                        x, y, w, h = map(int, face[:4])
+                        aligned = recognizer.alignCrop(frame, face)
+                        vector = recognizer.feature(aligned)
+                        score, student_id, name = ref_store.best_match(registered_students, vector)
+                        recognized = score >= args.match_threshold and student_id is not None
+                        color = (0, 255, 0) if recognized else (0, 0, 255)
+                        label = f"{name} ({student_id})" if recognized else "Unknown"
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                        cv2.putText(frame, label, (x, max(y - 10, 25)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+                        cv2.putText(frame, f"Score: {score:.3f}", (x, y + h + 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        if not recognized:
+                            continue
 
-                # -----------------------------
-                # Mark Attendance
-                # -----------------------------
-                # Only insert if we have not already marked today for this
-                # student in this run of the process. Persisted uniqueness
-                # is enforced by the schema constraint that `database.py`
-                # will create on the next schema update.
-                if student_id not in marked_today:
+                        hit_this_sample[student_id] = float(score)
+                        with api.connect() as db:
+                            action, _ = harvest.maybe_store(db, student_id, vector, score)
+                            # Harvesting is optional; attendance evidence is saved independently.
+                            if action:
+                                registered_students = [
+                                    row for row in registered_students if row[0] != student_id
+                                ]
+                                primary = db.execute(
+                                    "SELECT embedding FROM students WHERE student_id=?",
+                                    (student_id,),
+                                ).fetchone()
+                                if primary and primary["embedding"]:
+                                    registered_students.append(ref_store.as_match_rows(
+                                        student_id, name,
+                                        np.frombuffer(primary["embedding"], dtype=np.float32),
+                                    ))
+                                for reference in ref_store.load_student_references(db, student_id):
+                                    registered_students.append(
+                                        ref_store.as_match_rows(student_id, name, reference)
+                                    )
 
-                    cursor = connection.cursor()
-
-                    # Application-layer uniqueness guard in case the index
-                    # was not created (e.g. legacy DB without the migration).
-                    # When this guard or the index is both active, cancellation
-                    # of a duplicate insert is handled by the index.
-                    existing = cursor.execute(
-                        """
-                            SELECT 1 FROM attendance
-                            WHERE student_id = ? AND date = ?
-                            LIMIT 1
-                        """,
-                        (student_id, today),
-                    ).fetchone()
-
-                    if existing:
-                        marked_today.add(student_id)
-
+                for student_id, event_score in hit_this_sample.items():
+                    previous = last_hit.get(student_id)
+                    if previous is None or now_monotonic - previous > args.confirm_window:
+                        candidate_hits[student_id] = 1
                     else:
-
-                        cursor.execute(
-                            """
-                                INSERT INTO attendance
-                                (student_id, date, in_time, out_time)
-                                VALUES (?, ?, ?, NULL)
-                            """,
-                            (student_id, today, current_time),
+                        candidate_hits[student_id] += 1
+                    last_hit[student_id] = now_monotonic
+                    event_key = (slot["id"], student_id)
+                    if candidate_hits[student_id] < args.confirm_hits or event_key in recorded:
+                        continue
+                    with api.connect() as db:
+                        accepted = api.record_camera_attendance_event(
+                            db, args.section_id, slot, now.date(), student_id,
+                            args.camera_id, args.event_type, now, min(max(event_score, 0.0), 1.0),
+                            args.late_grace_minutes, args.early_exit_review_minutes,
                         )
-
-                        connection.commit()
-
-                        marked_today.add(student_id)
-
+                    recorded.add(event_key)
+                    if accepted:
                         print(
-                            f"ATTENDANCE MARKED: "
-                            f"{name} ({student_id}) "
-                            f"IN at {current_time}"
+                            f"CAMERA {args.event_type.upper()}: {names[student_id]} "
+                            f"({student_id}) at {now.strftime('%H:%M:%S')} "
+                            f"[score {event_score:.3f}]"
                         )
 
+                for student_id in list(last_hit):
+                    if now_monotonic - last_hit[student_id] > args.confirm_window:
+                        last_hit.pop(student_id, None)
+                        candidate_hits.pop(student_id, None)
+
+            if not args.headless:
+                cv2.imshow("True Eye - Timetable Camera", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+    except KeyboardInterrupt:
+        print("Camera capture stopped.")
+    finally:
+        capture.release()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
-            # -----------------------------
-            # Unknown
-            # -----------------------------
-            else:
-
-                label = "Unknown"
-
-                box_color = (0, 0, 255)
-
-
-
-            # -----------------------------
-            # Draw rectangle
-            # -----------------------------
-            cv2.rectangle(
-                frame,
-                (x, y),
-                (x + w, y + h),
-                box_color,
-                2
-            )
-
-
-
-            # -----------------------------
-            # Name / ID
-            # -----------------------------
-            cv2.putText(
-                frame,
-                label,
-                (x, max(y - 10, 25)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                box_color,
-                2
-            )
-
-
-
-            # -----------------------------
-            # Score
-            # -----------------------------
-            cv2.putText(
-                frame,
-                f"Score: {best_score:.3f}",
-                (x, y + h + 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                box_color,
-                2
-            )
-
-
-
-    # -----------------------------
-    # Show camera
-    # -----------------------------
-    cv2.imshow(
-        "Smart Attendance - Live Recognition",
-        frame
-    )
-
-
-
-    # -----------------------------
-    # Quit
-    # -----------------------------
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-
-
-# Do not leave a SQLite connection open when the process exits.
-connection.close()
-
-camera.release()
-cv2.destroyAllWindows()
-
-print("Attendance system stopped.")
+if __name__ == "__main__":
+    run()

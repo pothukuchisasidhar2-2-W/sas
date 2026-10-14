@@ -14,6 +14,7 @@
 
 import { HttpError } from "./contract";
 import type { Api } from "./contract";
+import type { GoogleSignupStudentInput, GoogleSignupTeacherInput, Session } from "./contract";
 import { mockApi } from "./mock";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -66,6 +67,34 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return payload as T;
 }
 
+export function verifyGoogleIdentity(credential: string, nonce: string): Promise<{ name: string; email: string }> {
+  return request("/api/auth/google/identity", {
+    method: "POST", body: JSON.stringify({ credential, nonce }),
+  });
+}
+
+export function requestGoogleNonce(): Promise<{ nonce: string }> {
+  return request("/api/auth/google/nonce", { method: "POST" });
+}
+
+export function loginWithGoogle(credential: string, nonce: string): Promise<Session> {
+  return request("/api/auth/google/login", {
+    method: "POST", body: JSON.stringify({ credential, nonce }),
+  });
+}
+
+export function signupStudentWithGoogle(input: GoogleSignupStudentInput): Promise<Session> {
+  return request("/api/auth/google/signup/student", {
+    method: "POST", body: JSON.stringify(input),
+  });
+}
+
+export function signupTeacherWithGoogle(input: GoogleSignupTeacherInput): Promise<Session> {
+  return request("/api/auth/google/signup/teacher", {
+    method: "POST", body: JSON.stringify(input),
+  });
+}
+
 /**
  * The API surface the app uses. With VITE_API_URL set, each method hits the
  * route documented in contract.ts; otherwise the mock store answers.
@@ -112,10 +141,20 @@ export const api: Api = USING_MOCK
         }),
       markAttendance: (_token, input) =>
         request("/api/teacher/attendance", { method: "PATCH", body: JSON.stringify(input) }),
+      attendanceSession: (_token, params) => {
+        const query = new URLSearchParams(params);
+        return request(`/api/teacher/attendance/session?${query.toString()}`);
+      },
+      completeAttendanceSession: (_token, input) =>
+        request("/api/teacher/attendance/complete", { method: "POST", body: JSON.stringify(input) }),
       teacherSchedule: (_token, date) =>
         request(`/api/teacher/schedule?date=${encodeURIComponent(date)}`),
-      sectionTimetable: (_token, sectionId) =>
-        request(`/api/timetable?sectionId=${encodeURIComponent(sectionId)}`),
+      sectionTimetable: (_token, sectionId, date) =>
+        request(`/api/timetable?sectionId=${encodeURIComponent(sectionId)}${date ? `&date=${encodeURIComponent(date)}` : ""}`),
+      previewTimetableChange: (_token, input) =>
+        request("/api/teacher/timetable/changes/preview", { method: "POST", body: JSON.stringify(input) }),
+      createTimetableChange: (_token, input) =>
+        request("/api/teacher/timetable/changes", { method: "POST", body: JSON.stringify(input) }),
       uploadTimetable: (_token, input) =>
         request("/api/teacher/timetable/upload", { method: "POST", body: JSON.stringify(input) }),
       previewTimetable: (_token, input) =>

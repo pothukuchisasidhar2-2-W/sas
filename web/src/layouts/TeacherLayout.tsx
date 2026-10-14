@@ -16,6 +16,7 @@ export default function TeacherLayout() {
   const { user } = useAuth();
   if (!user || user.role !== "teacher") return null;
   const teacher = user.profile;
+  const nav = teacher.departmentId ? NAV : NAV.filter((item) => item.to !== "/teacher/department");
 
   const initials = teacher.name
     .split(/\s+/)
@@ -25,7 +26,7 @@ export default function TeacherLayout() {
 
   return (
     <AppShell
-      nav={NAV}
+      nav={nav}
       profile={
         <Link
           to="/teacher/department"

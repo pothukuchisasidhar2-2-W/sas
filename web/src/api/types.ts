@@ -52,6 +52,24 @@ export interface TimetableSlot {
   startTime: string; // "10:00"
   endTime: string; // "10:50"
   room: string;
+  dateChange?: "modified" | "added";
+}
+
+export interface TimetableChangeInput {
+  date: string;
+  sectionId: string;
+  kind: "cancel" | "modify" | "add";
+  slotId?: string;
+  subjectId?: string;
+  startTime?: string;
+  endTime?: string;
+  room?: string;
+}
+
+export interface TimetableChangePreview {
+  kind: TimetableChangeInput["kind"];
+  date: string;
+  slot: TimetableSlot;
 }
 
 export interface AttendanceRecord {
@@ -73,6 +91,7 @@ export interface StudentProfile {
   userId: string;
   name: string;
   email: string;
+  collegeName?: string;
   branch: string;
   year: number;
   section: string;
@@ -101,6 +120,7 @@ export interface TeacherProfile {
   userId: string;
   name: string;
   email: string;
+  collegeName?: string;
   departmentId: string | null;
   departmentName: string | null;
   isHod: boolean;
@@ -181,7 +201,7 @@ export interface SubjectAttendanceSummary {
   absentCount: number;
   lateCount: number;
   excusedCount: number;
-  /** (present + late) / held, as a 0–100 number. null when nothing held yet. */
+  /** (present + late) / completed, non-excused sessions, as a 0–100 number. */
   percentage: number | null;
 }
 
@@ -201,4 +221,12 @@ export interface ClassAttendanceRow {
   inTime: string | null;
   method: AttendanceMethod | null;
   enrollmentStatus: "pending" | "approved" | "rejected";
+  reviewRequired?: boolean;
+  reviewReason?: "early_exit" | "not_observed" | null;
+}
+
+export interface AttendanceSessionState {
+  completed: boolean;
+  completedAt: string | null;
+  cameraSession?: boolean;
 }

@@ -44,6 +44,7 @@ export default function TeacherClasses() {
   const [query, setQuery] = useState("");
   const [busyRow, setBusyRow] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   // The class actually in view: whatever was chosen, otherwise the first class
   // in scope. Derived rather than stored, so arriving class data does not cost
@@ -77,6 +78,10 @@ export default function TeacherClasses() {
     if (!sectionId) return [];
     return api.teacherRoster(token, { sectionId, date, slotId: slotId || undefined });
   });
+  const sessionState = useApiData([token, sectionId, date, slotId], async () => {
+    if (!sectionId || !slotId) return { completed: false, completedAt: null };
+    return api.attendanceSession(token, { sectionId, date, slotId });
+  });
 
   const rows = roster.data ?? [];
   const filtered = useMemo(() => {
@@ -93,17 +98,22 @@ export default function TeacherClasses() {
     for (const row of rows) tally[row.status] += 1;
     return tally;
   }, [rows]);
+  const reviewCount = rows.filter((row) => row.reviewRequired).length;
 
   if (!user || user.role !== "teacher") return null;
 
   const activeSlot = (periods.data ?? []).find((slot) => slot.id === slotId) ?? null;
-  const canMark = Boolean(activeSlot);
+  const canMark = Boolean(activeSlot && activeSlot.teacherId === teacher?.userId
+    && teacher.assignments.some((assignment) =>
+      assignment.sectionId === sectionId && assignment.subjectId === activeSlot.subjectId,
+    ));
   const member = teacher ? teacher.assignments.some((a) => a.sectionId === sectionId) : false;
 
   const mark = async (studentId: string, status: AttendanceStatus) => {
     if (!activeSlot) return;
     setBusyRow(studentId);
     setActionError(null);
+    setActionNotice(null);
     try {
       await api.markAttendance(token, {
         studentId,
@@ -113,6 +123,27 @@ export default function TeacherClasses() {
         sectionId,
       });
       roster.reload();
+    } catch (cause) {
+      setActionError(errorMessage(cause));
+    } finally {
+      setBusyRow(null);
+    }
+  };
+
+  const completeSession = async () => {
+    if (!activeSlot || !canMark) return;
+    setBusyRow("__complete__");
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const result = await api.completeAttendanceSession(token, { sectionId, date, slotId: activeSlot.id });
+      roster.reload();
+      sessionState.reload();
+      if (!result.completed) {
+        setActionNotice(
+          `${result.reviewRequired} camera attendance item(s) need your review. Set a period mark for each flagged student, then complete the session.`,
+        );
+      }
     } catch (cause) {
       setActionError(errorMessage(cause));
     } finally {
@@ -150,7 +181,7 @@ export default function TeacherClasses() {
       <Card className="mb-5">
         <CardHeader
           title="Which class?"
-          description="Pick a section, a date and a period. Choosing a period enables corrections."
+          description="Pick a section, date and period to record or correct attendance. Camera sessions require teacher review for unobserved students and early exits."
         />
         <CardBody className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Field label="Class / section">
@@ -196,16 +227,52 @@ export default function TeacherClasses() {
         </CardBody>
       </Card>
 
-      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-5">
         <StatTile label="Present" value={counts.present} tone="text-present" />
         <StatTile label="Absent" value={counts.absent} tone="text-absent" />
         <StatTile label="Late" value={counts.late} tone="text-late" />
         <StatTile label="Not marked" value={counts.unmarked} tone="text-pending" />
+        <StatTile label="Needs review" value={reviewCount} tone="text-late" />
       </div>
 
+      {actionNotice && (
+        <div className="mb-5">
+          <Alert tone="warning" title="Teacher review required">{actionNotice}</Alert>
+        </div>
+      )}
       {actionError && (
         <div className="mb-5">
           <Alert tone="error">{actionError}</Alert>
+        </div>
+      )}
+
+      {activeSlot && canMark && (
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface p-4">
+          {sessionState.loading ? (
+            <span className="text-[13px] text-muted">Checking session status…</span>
+          ) : sessionState.error ? (
+            <Alert tone="error">{sessionState.error}</Alert>
+          ) : sessionState.data?.completed ? (
+            <Alert tone="success" title="Session completed">
+              {sessionState.data.cameraSession
+                ? "Camera attendance items were reviewed before completion. You can still correct individual marks."
+                : "Remaining approved students were marked absent. You can still correct individual marks."}
+            </Alert>
+          ) : (
+            <>
+              <p className="text-[13px] text-muted">
+                When this period is over, complete it. Camera sessions require teacher review for students not seen and early exits.
+              </p>
+              <Button
+                variant="secondary"
+                loading={busyRow === "__complete__"}
+                disabled={date > isoToday() || periods.loading}
+                onClick={completeSession}
+              >
+                Complete session
+              </Button>
+            </>
+          )}
         </div>
       )}
 
@@ -265,6 +332,7 @@ export default function TeacherClasses() {
                 <Th>Name</Th>
                 <Th>Membership</Th>
                 <Th>Status</Th>
+                <Th>Attendance review</Th>
                 <Th>Marked</Th>
                 <Th align="right">In time</Th>
                 <Th align="right">Period mark</Th>
@@ -285,6 +353,15 @@ export default function TeacherClasses() {
                     <StatusBadge status={row.status} />
                   </Td>
                   <Td>
+                    {row.reviewRequired ? (
+                      <Badge tone="late">
+                        {row.reviewReason === "early_exit" ? "Early exit" : "Not seen"}
+                      </Badge>
+                    ) : (
+                      <span className="text-faint">—</span>
+                    )}
+                  </Td>
+                  <Td>
                     {row.method === "face" ? (
                       <Badge tone="brand">Camera</Badge>
                     ) : row.method === "manual" ? (
@@ -297,7 +374,7 @@ export default function TeacherClasses() {
                     {row.inTime ?? "—"}
                   </Td>
                   <Td align="right">
-                    {activeSlot && row.enrollmentStatus === "approved" ? (
+                    {canMark && row.enrollmentStatus === "approved" ? (
                       <div className="flex justify-end gap-1">
                         {MARK_OPTIONS.map((status) => (
                           <button

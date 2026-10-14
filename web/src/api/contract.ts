@@ -11,6 +11,7 @@
 
 import type {
   AttendanceRecord,
+  AttendanceSessionState,
   AttendanceStatus,
   ClassAttendanceRow,
   Department,
@@ -21,6 +22,8 @@ import type {
   DeptReply,
   SessionUser,
   SubjectAttendanceSummary,
+  TimetableChangeInput,
+  TimetableChangePreview,
   TimetableSlot,
   TodayEntry,
 } from "./types";
@@ -56,7 +59,6 @@ export interface SignupTeacherInput {
   email: string;
   emailCode: string;
   password: string;
-  departmentName: string;
   assignments: Array<{
     subjectCode: string;
     subjectName: string;
@@ -65,6 +67,27 @@ export interface SignupTeacherInput {
     section: string;
   }>;
   /** One-time teacher invitation; class permissions are read from this code. */
+  inviteCode: string;
+}
+
+export interface GoogleSignupStudentInput {
+  credential: string;
+  nonce: string;
+  name: string;
+  email: string;
+  password: string;
+  branch: string;
+  year: number;
+  section: string;
+  studentId: string;
+}
+
+export interface GoogleSignupTeacherInput {
+  credential: string;
+  nonce: string;
+  name: string;
+  email: string;
+  password: string;
   inviteCode: string;
 }
 
@@ -152,13 +175,27 @@ export interface Api {
       sectionId: string;
     },
   ): Promise<AttendanceRecord>;
+  /** GET /api/teacher/attendance/session?sectionId=&date=&slotId= */
+  attendanceSession(
+    token: string,
+    params: { sectionId: string; date: string; slotId: string },
+  ): Promise<AttendanceSessionState>;
+  /** POST /api/teacher/attendance/complete */
+  completeAttendanceSession(
+    token: string,
+    input: { sectionId: string; date: string; slotId: string },
+  ): Promise<AttendanceSessionState & { absencesAdded: number; reviewRequired: number }>;
   /** GET /api/teacher/schedule?date= */
   teacherSchedule(token: string, date: string): Promise<TimetableSlot[]>;
   /**
    * GET /api/timetable?sectionId=
    * Readable by a student of that section, or a teacher in scope for it.
    */
-  sectionTimetable(token: string, sectionId: string): Promise<TimetableSlot[]>;
+  sectionTimetable(token: string, sectionId: string, date?: string): Promise<TimetableSlot[]>;
+  /** POST /api/teacher/timetable/changes/preview */
+  previewTimetableChange(token: string, input: TimetableChangeInput): Promise<TimetableChangePreview>;
+  /** POST /api/teacher/timetable/changes */
+  createTimetableChange(token: string, input: TimetableChangeInput): Promise<{ message: string }>;
   /**
    * POST /api/teacher/timetable/upload
    * CSV columns: day,start,end,subject_code,subject_name,section,room,teacher_email
