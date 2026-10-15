@@ -141,6 +141,39 @@ recognition events, while missed detections, feed outages, and unobserved
 students remain uncertain and require teacher review. Keep camera credentials
 out of source control and shared shell history.
 
+The teacher **Camera setup** page supports both connected USB cameras and
+operator-approved IP cameras. To grant a teacher access, configure the stream
+on the API host in `TRUE_EYE_IP_CAMERAS_JSON`. Each entry has an ID, display
+name, class section, and RTSP/HTTP URL; every teacher assigned to that section
+can use the camera. For example, set this in the API process environment before
+starting Uvicorn (replace the sample credentials and address):
+
+```powershell
+$env:TRUE_EYE_IP_CAMERAS_JSON = '[{"id":"room252-entry","name":"Room 252 entry","sectionId":"CSE-AIDS-2-A","url":"rtsp://camera-user:camera-password@192.168.1.50:554/stream1"}]'
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+Keep this environment value private and configure it on the API computer, not
+in `web/.env.local` or frontend code. The API returns only camera IDs and
+display names to teachers; it keeps stream URLs server-side. Restart the API
+after changing camera grants. Each camera ID should be unique and use only
+letters, numbers, hyphens, or underscores. The API host must be able to reach
+the camera stream on the local network.
+
+On **Teacher → Cameras**, choose separate cameras for **Entry** and **Exit**.
+Both recognition sessions and annotated live previews can run at once for one
+class; one camera cannot be assigned both directions simultaneously. Preview
+frames are transient and are not recorded or saved; timetable-linked attendance events continue to
+be handled by the recognition worker as before. The API process accepts frame
+posts from `127.0.0.1:8000` by default. If Uvicorn uses another local URL or
+port, set `TRUE_EYE_PREVIEW_API_URL` on the API host to that URL before starting
+the API.
+
+A face the camera did not recognize stays unobserved for teacher review; camera
+non-detection alone must not mark a student absent. Open **Attendance
+monitoring**, select the class, date, and scheduled period, then review and
+manually mark an unobserved student absent when confirmed.
+
 For the first pilot, standard IP CCTV cameras with accessible RTSP streams
 (and ONVIF support for discovery/configuration where available) are a better
 fit than buying separate IoT/AI cameras. Use distinct entrance and exit views;

@@ -181,7 +181,7 @@ export default function TeacherClasses() {
       <Card className="mb-5">
         <CardHeader
           title="Which class?"
-          description="Pick a section, date and period to record or correct attendance. Camera sessions require teacher review for unobserved students and early exits."
+          description="Choose a class, date, and period from its published timetable. Attendance is recorded for that scheduled period. Camera sessions require review for unobserved students and early exits."
         />
         <CardBody className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Field label="Class / section">
@@ -206,9 +206,9 @@ export default function TeacherClasses() {
             />
           </Field>
 
-          <Field label="Period" hint={canMark ? undefined : "Day view — pick a period to edit"}>
+          <Field label="Scheduled period" hint={canMark ? undefined : "Choose a scheduled period to record attendance"}>
             <Select value={slotId} onChange={(event) => setSlotId(event.target.value)}>
-              <option value="">Whole day</option>
+              <option value="">Select a timetable period</option>
               {(periods.data ?? []).map((slot) => (
                 <option key={slot.id} value={slot.id}>
                   {PERIOD_LABEL(slot.startTime, slot.endTime)} · {slot.subjectId}

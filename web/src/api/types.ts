@@ -25,6 +25,24 @@ export type AttendanceStatus =
 
 export type AttendanceMethod = "face" | "manual";
 
+export interface CameraDevice {
+  source: string;
+  name: string;
+  cameraType: "usb" | "ip";
+  sectionId?: string;
+}
+
+export interface RecognitionCameraRun {
+  source: string;
+  cameraId: string;
+  name: string;
+  cameraType: "usb" | "ip";
+  sectionId: string;
+  eventType: "entry" | "exit";
+  eventCode: 0 | 1;
+  running: boolean;
+}
+
 /** How a session was captured. Face = the liv_recog.py pipeline. */
 export interface ClassSection {
   id: string; // "CSE-3-A"
@@ -217,6 +235,7 @@ export interface TodayEntry {
 export interface ClassAttendanceRow {
   studentId: string;
   name: string;
+  faceEnrolled: boolean;
   status: AttendanceStatus;
   inTime: string | null;
   method: AttendanceMethod | null;

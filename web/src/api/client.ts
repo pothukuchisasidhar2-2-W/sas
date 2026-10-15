@@ -15,6 +15,8 @@
 import { HttpError } from "./contract";
 import type { Api } from "./contract";
 import type { GoogleSignupStudentInput, GoogleSignupTeacherInput, Session } from "./contract";
+import type { TeacherCreateStudentInput } from "./contract";
+import type { CameraDevice, RecognitionCameraRun } from "./types";
 import { mockApi } from "./mock";
 
 const API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
@@ -38,6 +40,41 @@ export async function completePasswordReset(email: string, code: string, passwor
   await request("/api/auth/password-reset", { method: "POST", body: JSON.stringify({ email, code, password }) });
 }
 
+export function listTeacherCameras(): Promise<{ devices: CameraDevice[]; running: RecognitionCameraRun[] }> {
+  if (USING_MOCK) throw new Error("Camera controls require the live API server.");
+  return request("/api/teacher/cameras");
+}
+
+export function teacherCameraStatus(): Promise<{ running: RecognitionCameraRun[] }> {
+  if (USING_MOCK) throw new Error("Camera controls require the live API server.");
+  return request("/api/teacher/cameras/status");
+}
+
+export function startTeacherCamera(input: {
+  source: string;
+  sectionId: string;
+  eventType: "entry" | "exit";
+}): Promise<RecognitionCameraRun> {
+  if (USING_MOCK) throw new Error("Camera controls require the live API server.");
+  return request("/api/teacher/cameras/start", {
+    method: "POST", body: JSON.stringify(input),
+  });
+}
+
+export function stopTeacherCamera(source: string): Promise<{ source: string; running: boolean }> {
+  if (USING_MOCK) throw new Error("Camera controls require the live API server.");
+  return request(`/api/teacher/cameras/${source}/stop`, { method: "POST" });
+}
+
+export async function createTeacherCameraPreviewUrl(source: string): Promise<string> {
+  if (USING_MOCK) throw new Error("Camera previews require the live API server.");
+  const { token } = await request<{ token: string }>(
+    `/api/teacher/cameras/${encodeURIComponent(source)}/preview-token`,
+    { method: "POST" },
+  );
+  return `${API_URL}/api/teacher/cameras/${encodeURIComponent(source)}/preview?token=${encodeURIComponent(token)}`;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
@@ -47,7 +84,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try {
     response = await fetch(`${API_URL}${path}`, { ...init, headers });
   } catch {
-    throw new HttpError(0, "Cannot reach the server. Is the API running?");
+    const target = API_URL || "the frontend origin";
+    throw new HttpError(
+      0,
+      `Could not connect to the API at ${target}. Check VITE_API_URL, that the API is running, and that its CORS settings allow this page's origin.`,
+    );
   }
 
   if (response.status === 204) return undefined as T;
@@ -138,6 +179,12 @@ export const api: Api = USING_MOCK
         request(`/api/teacher/students/${encodeURIComponent(studentId)}/enrollment`, {
           method: "PATCH",
           body: JSON.stringify({ sectionId, status }),
+        }),
+      teacherCreateStudent: (_token, input: TeacherCreateStudentInput) =>
+        request("/api/teacher/students", { method: "POST", body: JSON.stringify(input) }),
+      teacherEnrollFace: (_token, studentId, sectionId, image) =>
+        request(`/api/teacher/students/${encodeURIComponent(studentId)}/face`, {
+          method: "POST", body: JSON.stringify({ sectionId, image }),
         }),
       markAttendance: (_token, input) =>
         request("/api/teacher/attendance", { method: "PATCH", body: JSON.stringify(input) }),

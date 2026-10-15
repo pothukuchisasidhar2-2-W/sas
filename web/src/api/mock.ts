@@ -351,12 +351,24 @@ export const mockApi: Api = {
     if (db.users.some((u) => u.email.toLowerCase() === input.email.toLowerCase())) {
       fail(409, "That email is already registered.");
     }
-    if (db.students.some((s) => s.studentId === input.studentId)) {
-      fail(409, `Roll number ${input.studentId} is already registered.`);
-    }
-
     const userId = `u-${input.studentId}`;
     const section = ensureSection(input.branch, input.year, input.section);
+    const existingProfile = db.students.find((s) => s.studentId === input.studentId);
+    const existingAccount = existingProfile && db.users.find((user) => user.id === existingProfile.userId);
+    if (existingProfile && existingAccount?.claimableStudent) {
+      if (existingAccount.claimEmail?.toLowerCase() !== input.email.toLowerCase()) {
+        fail(403, "Use the email address entered by your teacher for this student record.");
+      }
+      if (existingProfile.sectionId !== section.id) fail(409, "The class details must match the student record created by their teacher.");
+      existingAccount.email = input.email;
+      existingAccount.password = input.password;
+      existingAccount.claimableStudent = false;
+      existingAccount.claimEmail = undefined;
+      Object.assign(existingProfile, { name: input.name, email: input.email });
+      persist();
+      return { token: `mock.${existingAccount.id}`, user: { role: "student", profile: existingProfile } };
+    }
+    if (existingProfile) fail(409, `Roll number ${input.studentId} is already registered.`);
     db.users.push({ id: userId, email: input.email, password: input.password, role: "student" });
 
     const profile: StudentProfile = {
@@ -587,6 +599,7 @@ export const mockApi: Api = {
           return {
             studentId: student.studentId,
             name: student.name,
+            faceEnrolled: student.faceEnrolled,
             status: "unmarked",
             inTime: null,
             method: null,
@@ -602,6 +615,7 @@ export const mockApi: Api = {
         return {
           studentId: student.studentId,
           name: student.name,
+          faceEnrolled: student.faceEnrolled,
           status: best.status,
           inTime: best.inTime,
           method: best.method,
@@ -618,6 +632,52 @@ export const mockApi: Api = {
     if (!student) fail(404, "Student class request was not found.");
     student.enrollmentStatus = status;
     persist();
+  },
+
+  async teacherCreateStudent(token, input) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    assertSectionInScope(token, input.sectionId);
+    if (!input.image.startsWith("data:image/") || input.image.length < 4000) fail(422, "Capture a clear face photo first.");
+    if (db.students.some((student) => student.studentId === input.studentId)) fail(409, "That roll number already exists in this demo.");
+    if (db.users.some((account) => account.email.toLowerCase() === input.email.toLowerCase())) fail(409, "An account already uses that email address.");
+    const section = db.sections.find((item) => item.id === input.sectionId);
+    if (!section) fail(404, "Class section was not found.");
+    const userId = `claim-${input.studentId}-${Date.now()}`;
+    const profile: StudentProfile = {
+      studentId: input.studentId,
+      userId,
+      name: input.name,
+      email: input.email,
+      branch: section.branch,
+      year: section.year,
+      section: section.section,
+      sectionId: section.id,
+      faceEnrolled: true,
+      harvestedReferences: 0,
+      joinedAt: toIsoDate(new Date()),
+      enrollmentStatus: "approved",
+    };
+    db.users.push({ id: userId, email: `claim-${userId}@pending.invalid`, password: `unusable-${Date.now()}`, role: "student", claimableStudent: true, claimEmail: input.email });
+    db.students.push(profile);
+    section.strength += 1;
+    persist();
+    return { studentId: profile.studentId, accountStatus: "awaiting_student_claim" };
+  },
+
+  async teacherEnrollFace(token, studentId, sectionId, image) {
+    await net();
+    const user = currentUser(token);
+    if (user.role !== "teacher") fail(403, "Teachers only.");
+    assertSectionInScope(token, sectionId);
+    if (!image.startsWith("data:image/") || image.length < 4000) fail(422, "Capture a clear face photo first.");
+    const student = db.students.find((item) => item.studentId === studentId && item.sectionId === sectionId);
+    if (!student) fail(404, "Student is not on this class roster.");
+    student.faceEnrolled = true;
+    student.harvestedReferences = 0;
+    persist();
+    return { faceEnrolled: true };
   },
 
   async markAttendance(token, input) {

@@ -16,18 +16,48 @@ import {
   Input,
   Select,
   Spinner,
-  TableWrap,
-  Td,
-  Th,
-  Textarea,
 } from "../../components/ui";
 import { useAuth, useToken } from "../../lib/auth";
 import { DAY_NAMES, PERIOD_LABEL, formatLongDate, isoToday } from "../../lib/format";
 import { useApiData } from "../../lib/useApiData";
 
-const HEADER = "day,start,end,subject_code,subject_name,section,room,teacher_email";
+type PreviewSlot = {
+  id: string;
+  dayOfWeek: number;
+  startTime: string;
+  endTime: string;
+  subjectId: string;
+  subjectName?: string;
+  room: string;
+};
 
-const csvCell = (value: string) => /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+function WeekGrid({ slots, emptyText }: { slots: PreviewSlot[]; emptyText: string }) {
+  if (!slots.length) return <p className="py-8 text-center text-sm text-muted">{emptyText}</p>;
+  return (
+    <div className="overflow-x-auto">
+      <div className="grid min-w-[900px] grid-cols-6 gap-2">
+        {[1, 2, 3, 4, 5, 6].map((day) => {
+          const daySlots = slots.filter((slot) => slot.dayOfWeek === day).sort((a, b) => a.startTime.localeCompare(b.startTime));
+          return (
+            <div key={day} className="min-h-32 rounded-field border border-line bg-canvas/60 p-2">
+              <h3 className="mb-2 border-b border-line pb-2 text-xs font-semibold text-ink">{DAY_NAMES[day]}</h3>
+              <div className="flex flex-col gap-2">
+                {daySlots.length ? daySlots.map((slot) => (
+                  <article key={slot.id} className="rounded-field border border-brand/15 bg-brand-soft px-2 py-2">
+                    <p className="text-[10px] tabular-nums text-brand">{PERIOD_LABEL(slot.startTime, slot.endTime)}</p>
+                    <p className="mt-1 break-words text-xs font-semibold text-ink">{slot.subjectName || slot.subjectId}</p>
+                    <p className="text-[10px] text-muted">{slot.subjectId}</p>
+                    {slot.room && <p className="mt-0.5 text-[10px] text-muted">{slot.room}</p>}
+                  </article>
+                )) : <p className="py-3 text-center text-[10px] text-faint">No classes</p>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 export default function TeacherTimetable() {
   const { user } = useAuth();
@@ -72,8 +102,13 @@ export default function TeacherTimetable() {
   if (!user || user.role !== "teacher") return null;
 
   const slots = timetable.data ?? [];
+  const selectedDate = changeDate ? new Date(`${changeDate}T00:00:00`) : null;
+  const selectedWeekday = selectedDate ? selectedDate.getDay() : -1;
+  const selectedWeekdayIso = selectedWeekday === 0 ? 7 : selectedWeekday;
+  const recurringForDate = slots
+    .filter((slot) => slot.dayOfWeek === selectedWeekdayIso)
+    .sort((a, b) => a.startTime.localeCompare(b.startTime));
   const assignedSubjects = teacher?.assignments.filter((item) => item.sectionId === sectionId) ?? [];
-  const exampleAssignment = assignedSubjects[0];
   const assignedSubjectIds = new Set(assignedSubjects.map((assignment) => assignment.subjectId));
   const scheduledForDate = (dateSchedule.data ?? []).filter((slot) =>
     assignedSubjectIds.has(slot.subjectId),
@@ -149,40 +184,6 @@ export default function TeacherTimetable() {
     }
   };
 
-  const downloadTemplate = () => {
-    const content = `\uFEFF${HEADER}\n`;
-    const url = URL.createObjectURL(new Blob([content], { type: "text/csv;charset=utf-8" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "sahe-timetable-template.csv";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  };
-
-  const fillTemplate = () => {
-    const sample = slots.slice(0, 3);
-    const lines = sample.length
-      ? sample.map((slot) =>
-          [
-            DAY_NAMES[slot.dayOfWeek].slice(0, 3),
-            slot.startTime,
-            slot.endTime,
-            slot.subjectId,
-            slot.subjectId,
-            slot.sectionId,
-            slot.room,
-            teacher?.email ?? "",
-          ].join(","),
-        )
-      : [`Mon,09:00,09:50,CS301,Database Management Systems,${sectionId || "CSE-3-A"},CS-Block 201,${teacher?.email ?? ""}`];
-    setCsv([HEADER, ...lines].join("\n"));
-    setFileName("");
-    setResult(null);
-    setError(null);
-  };
-
   const upload = async () => {
     if (!sectionId) {
       setError("Choose a class first.");
@@ -194,6 +195,8 @@ export default function TeacherTimetable() {
       const outcome = await api.uploadTimetable(token, { sectionId, csv });
       setResult(outcome);
       setPreviewReady(false);
+      setCsv("");
+      setFileName("");
       timetable.reload();
     } catch (cause) {
       setError(errorMessage(cause));
@@ -220,18 +223,21 @@ export default function TeacherTimetable() {
     }
   };
 
-  const byDay = new Map<number, typeof slots>();
-  for (const slot of slots) {
-    const list = byDay.get(slot.dayOfWeek) ?? [];
-    list.push(slot);
-    byDay.set(slot.dayOfWeek, list);
-  }
+  const proposedSlots = previewReady && result && result.imported + result.replaced > 0 ? result.preview ?? [] : [];
+  const publishedSlots: PreviewSlot[] = slots.map((slot) => ({
+    id: slot.id,
+    dayOfWeek: slot.dayOfWeek,
+    startTime: slot.startTime,
+    endTime: slot.endTime,
+    subjectId: slot.subjectId,
+    room: slot.room,
+  }));
 
   return (
     <PageBody>
       <PageHeader
         title="Timetable"
-        description="Add the weekly schedule for one of your classes. Choose a CSV to validate it, review the rows, then publish."
+        description="Upload a class schedule, review it as a weekly grid, then publish it for students and attendance."
         actions={<Badge tone="brand">{sectionId || "No class selected"}</Badge>}
       />
 
@@ -447,7 +453,25 @@ export default function TeacherTimetable() {
                 ))}
               </ul>
             ) : (
-              <p className="py-2 text-xs text-muted">No periods are scheduled for this date.</p>
+              <div className="rounded-field bg-canvas px-3 py-3">
+                <p className="text-xs font-medium text-ink">No one-time changes for this date.</p>
+                {recurringForDate.length ? (
+                  <>
+                    <p className="mt-1 text-xs text-muted">The regular {selectedDate ? DAY_NAMES[selectedDate.getDay()] : "weekly"} timetable still applies:</p>
+                    <ul className="mt-2 divide-y divide-line">
+                      {recurringForDate.map((slot) => (
+                        <li key={slot.id} className="flex flex-wrap items-center gap-2 py-2 text-[13px]">
+                          <span className="w-28 tabular-nums text-muted">{PERIOD_LABEL(slot.startTime, slot.endTime)}</span>
+                          <span className="font-medium text-ink">{slot.subjectId}</span>
+                          <span className="text-muted">{slot.room}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                ) : (
+                  <p className="mt-1 text-xs text-muted">There are no regular periods on this weekday.</p>
+                )}
+              </div>
             )}
           </div>
         </CardBody>
@@ -475,37 +499,7 @@ export default function TeacherTimetable() {
               title="Nothing published yet"
               description="Add real class periods, review the CSV and publish it. The periods will appear here."
             />
-          ) : (
-            <TableWrap>
-              <thead>
-                <tr>
-                  <Th>Day</Th>
-                  <Th>Period</Th>
-                  <Th>Subject</Th>
-                  <Th>Room</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {[1, 2, 3, 4, 5, 6].flatMap((day) => {
-                  const list = (byDay.get(day) ?? []).slice().sort((a, b) =>
-                    a.startTime.localeCompare(b.startTime),
-                  );
-                  return list.map((slot, index) => (
-                    <tr key={slot.id} className="hover:bg-canvas">
-                      <Td className="font-medium">
-                        {index === 0 ? DAY_NAMES[day].slice(0, 3) : ""}
-                      </Td>
-                      <Td className="tabular-nums text-muted">
-                        {PERIOD_LABEL(slot.startTime, slot.endTime)}
-                      </Td>
-                      <Td className="font-medium">{slot.subjectId}</Td>
-                      <Td className="text-muted">{slot.room}</Td>
-                    </tr>
-                  ));
-                })}
-              </tbody>
-            </TableWrap>
-          )}
+          ) : <CardBody className="pt-4"><WeekGrid slots={publishedSlots} emptyText="No periods published." /></CardBody>}
         </Card>
 
         {/* Upload */}
@@ -513,17 +507,8 @@ export default function TeacherTimetable() {
           <CardHeader
             title="Upload weekly timetable"
             description="Choose a CSV, review the import, then publish it for this class."
-            action={
-              <Button variant="secondary" size="sm" onClick={downloadTemplate} disabled={!sectionId}>
-                Download template
-              </Button>
-            }
           />
           <CardBody className="flex flex-col gap-4">
-            <div className="flex items-center gap-2 text-xs font-medium text-muted">
-              <span className="grid size-6 place-items-center rounded-full bg-brand-soft text-brand">1</span>
-              <span>Choose a timetable CSV</span>
-            </div>
             <div
               className={`rounded-card border border-dashed p-4 transition-colors ${
                 draggingFile ? "border-brand bg-brand-soft" : "border-line-strong bg-canvas"
@@ -565,9 +550,9 @@ export default function TeacherTimetable() {
                     {busy && fileName
                       ? "Checking rows against your assigned subjects…"
                       : previewReady && result
-                        ? `${result.imported + result.replaced} valid period${result.imported + result.replaced === 1 ? "" : "s"} found. Review the results below.`
+                        ? `${result.imported + result.replaced} valid period${result.imported + result.replaced === 1 ? "" : "s"}. Review the weekly grid below.`
                         : fileName
-                          ? "File loaded. Select Check timetable to validate it for this class."
+                          ? "File loaded. Review the timetable to prepare its preview."
                           : "Drag a .csv file here, or choose one from your device."}
                   </p>
                 </div>
@@ -588,48 +573,10 @@ export default function TeacherTimetable() {
               files are not supported yet.
             </p>
 
-            <div className="rounded-field border border-line bg-canvas px-3.5 py-3 text-xs leading-relaxed text-muted">
-              <p className="font-medium text-ink">A template is empty until you add your schedule</p>
-              <p className="mt-1">Each row needs a day, start and end time, subject code and name, and this class section. For example:</p>
-              <code className="mt-2 block break-all rounded bg-surface px-2 py-1.5 font-mono text-[11px] text-ink">
-                {exampleAssignment
-                  ? ["Mon", "09:00", "09:50", exampleAssignment.subjectCode, exampleAssignment.subjectName, sectionId, "Room 101", teacher?.email ?? ""].map(csvCell).join(",")
-                  : `Mon,09:00,09:50,SUBJECT_CODE,Subject name,${sectionId || "CLASS-SECTION"},Room 101,teacher email`}
-              </code>
-              <p className="mt-1">Replace the example values with your real timetable periods before publishing.</p>
-            </div>
-
-            <Field
-              label="Or paste CSV"
-              hint="Required columns: day, start, end, subject_code, subject_name, section. Room and teacher_email are optional. Use Mon–Sat and 24-hour H:MM or HH:MM times."
-            >
-              <Textarea
-                value={csv}
-                onChange={(event) => {
-                  setCsv(event.target.value);
-                  setFileName("");
-                  setPreviewReady(false);
-                  setResult(null);
-                }}
-                spellCheck={false}
-                className="min-h-40 font-mono text-xs"
-                placeholder={HEADER}
-              />
-            </Field>
-
+            {fileName && <p className="text-xs text-muted">CSV columns: day, start, end, subject code, subject name, section. Room is optional; only assigned subjects for this class can be published.</p>}
             <div className="flex flex-wrap items-center gap-2">
-              <Button variant="ghost" size="sm" onClick={fillTemplate} disabled={!sectionId}>
-                Insert example rows
-              </Button>
-            </div>
-
-            <div className="flex items-center gap-2 text-xs font-medium text-muted">
-              <span className="grid size-6 place-items-center rounded-full bg-brand-soft text-brand">2</span>
-              <span>Review and validate</span>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button onClick={() => void preview()} loading={busy} disabled={!csv.trim() || !sectionId}>
-                Check timetable
+              <Button onClick={() => void preview()} loading={busy} disabled={!csv.trim() || !sectionId || previewReady}>
+                {previewReady ? "Timetable reviewed" : "Review timetable"}
               </Button>
               {previewReady && result && result.imported + result.replaced > 0 && (
                 <Button variant="secondary" onClick={upload} loading={busy}>
@@ -681,16 +628,27 @@ export default function TeacherTimetable() {
               </Alert>
             )}
 
-            <div className="flex items-center gap-2 text-xs font-medium text-muted">
-              <span className="grid size-6 place-items-center rounded-full bg-brand-soft text-brand">3</span>
-              <span>Publish to make it visible to students</span>
-            </div>
-            <div className="rounded-field bg-canvas px-3.5 py-3">
-              <p className="text-xs font-medium text-ink">What happens when you publish?</p>
-              <p className="mt-1 text-xs leading-relaxed text-muted">
-                Only valid rows for {sectionId || "the selected class"} are saved. The subject must be assigned to you. You can omit teacher_email; rows then use your account. Re-uploading a day and start time updates that period.
-              </p>
-            </div>
+            {previewReady && result && result.imported + result.replaced > 0 && (
+              <div className="rounded-field border border-line p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[13px] font-semibold text-ink">Weekly CSV preview</p>
+                    <p className="text-xs text-muted">{proposedSlots.length} readable periods across the week for {sectionId}</p>
+                  </div>
+                  <Badge tone="brand">Not published</Badge>
+                </div>
+                <WeekGrid slots={proposedSlots} emptyText="No valid periods to preview." />
+                {result.errors.length > 0 && <p className="mt-3 text-xs text-muted">The grid shows rows accepted by validation. Review rejected rows in the warning above.</p>}
+              </div>
+            )}
+            {previewReady && result && result.imported + result.replaced > 0 && (
+              <p className="text-xs leading-relaxed text-muted">Publishing makes this schedule available to students and uses its periods for attendance.</p>
+            )}
+            {!previewReady && result && (
+              <Alert tone="success" title="Timetable published">
+                {result.imported} new and {result.replaced} existing periods saved. The weekly schedule has been refreshed.
+              </Alert>
+            )}
           </CardBody>
         </Card>
       </div>

@@ -6,6 +6,7 @@ are additive so the local recognition scripts continue to use the same data.
 from __future__ import annotations
 
 import base64
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -17,6 +18,10 @@ import secrets
 import smtplib
 import sqlite3
 import ssl
+import subprocess
+import sys
+import threading
+import time as monotonic_time
 import uuid
 from email.message import EmailMessage
 from contextlib import asynccontextmanager, contextmanager
@@ -26,8 +31,9 @@ from typing import Any, Iterator
 
 import cv2
 import numpy as np
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +45,9 @@ OTP_MINUTES = 10
 ATTENDANCE_THRESHOLD = float(os.environ.get("TRUE_EYE_ATTENDANCE_THRESHOLD", "75"))
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
 SAHE_INSTITUTION_NAME = "Siddhartha Academy of Higher Education"
+CAMERA_SOURCE_LIMIT = 8
+_camera_process_lock = threading.Lock()
+_camera_processes: dict[str, dict[str, Any]] = {}
 
 
 @contextmanager
@@ -63,7 +72,8 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('student','teacher')),
   name TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
-  google_sub TEXT, college_name TEXT NOT NULL DEFAULT ''
+  google_sub TEXT, college_name TEXT NOT NULL DEFAULT '',
+  claimable_student INTEGER NOT NULL DEFAULT 0, claim_email TEXT
 );
 CREATE TABLE IF NOT EXISTS api_sessions (
   token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -204,6 +214,11 @@ def init_db() -> None:
             db.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
         if "college_name" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN college_name TEXT NOT NULL DEFAULT ''")
+        if "claimable_student" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN claimable_student INTEGER NOT NULL DEFAULT 0")
+        if "claim_email" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN claim_email TEXT")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_claim_email ON users(claim_email) WHERE claim_email IS NOT NULL")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL")
         profile_columns = {row["name"] for row in db.execute("PRAGMA table_info(student_profiles)")}
         if "enrollment_status" not in profile_columns:
@@ -393,6 +408,12 @@ class TimetableInput(BaseModel):
     csv: str = Field(min_length=1, max_length=1_000_000)
 
 
+class CameraStartInput(BaseModel):
+    source: str = Field(min_length=1, max_length=100)
+    sectionId: str = Field(min_length=1, max_length=64)
+    eventType: str = Field(pattern="^(entry|exit)$")
+
+
 class TimetableChangeInput(BaseModel):
     date: str
     sectionId: str
@@ -407,13 +428,33 @@ class TimetableChangeInput(BaseModel):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
-    yield
+    try:
+        yield
+    finally:
+        with _camera_process_lock:
+            for info in _camera_processes.values():
+                process = info["process"]
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+            _camera_processes.clear()
 
 
 app = FastAPI(title="True Eye API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.environ.get("TRUE_EYE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(","),
+    allow_origins=[origin.strip() for origin in os.environ.get(
+        "TRUE_EYE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",") if origin.strip()],
+    # Vite picks another port when 5173 is already occupied. Keep local
+    # development working without requiring an API restart for each port.
+    allow_origin_regex=os.environ.get(
+        "TRUE_EYE_CORS_ORIGIN_REGEX",
+        r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    ),
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
@@ -661,6 +702,22 @@ def signup_common(body: StudentSignup | TeacherSignup, role: str) -> dict[str, A
         if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (email,)).fetchone():
             raise HTTPException(409, "An account already uses that email address.")
         consume_email_code(db, email, "signup", body.emailCode)
+        if role == "student":
+            assert isinstance(body, StudentSignup)
+            sid = body.studentId.strip()
+            claimed = db.execute("""SELECT u.id,u.claimable_student,u.claim_email,p.section_id,s.branch,s.year,s.section
+              FROM student_profiles p JOIN users u ON u.id=p.user_id
+              JOIN sections s ON s.id=p.section_id WHERE p.student_id=?""", (sid,)).fetchone()
+            if claimed:
+                section_id = f"{body.branch.strip().upper()}-{int(body.year)}-{body.section.strip().upper()}"
+                if not claimed["claimable_student"] or claimed["claim_email"] != email:
+                    raise HTTPException(409, "That roll number already has a True Eye account. Sign in instead.")
+                if claimed["section_id"] != section_id:
+                    raise HTTPException(409, "The class details must match the student record created by their teacher.")
+                db.execute("UPDATE users SET email=?,password_hash=?,name=?,claimable_student=0,claim_email=NULL WHERE id=?",
+                           (email, hash_secret(body.password), body.name.strip(), claimed["id"]))
+                db.execute("UPDATE students SET name=? WHERE student_id=?", (body.name.strip(), sid))
+                return make_session(db, claimed["id"])
         user_id = uid()
         db.execute("INSERT INTO users(id,email,password_hash,role,name,created_at) VALUES (?,?,?,?,?,?)",
                    (user_id, email, hash_secret(body.password), role, body.name.strip(), now_iso()))
@@ -730,15 +787,24 @@ def google_signup_student(body: GoogleStudentSignup) -> dict[str, Any]:
         if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (identity["email"],)).fetchone():
             raise HTTPException(409, "An account already uses this Google email. Sign in instead.")
         sid = body.studentId.strip()
-        if db.execute("SELECT 1 FROM student_profiles WHERE student_id=?", (sid,)).fetchone():
-            raise HTTPException(409, "That roll number already has a True Eye account.")
+        claimed = db.execute("""SELECT u.id,u.claimable_student,u.claim_email,p.section_id
+          FROM student_profiles p JOIN users u ON u.id=p.user_id WHERE p.student_id=?""", (sid,)).fetchone()
+        section_id = f"{branch}-{body.year}-{section}"
+        if claimed:
+            if not claimed["claimable_student"] or claimed["claim_email"] != email:
+                raise HTTPException(409, "That roll number already has a True Eye account. Sign in instead.")
+            if claimed["section_id"] != section_id:
+                raise HTTPException(409, "The class details must match the student record created by their teacher.")
+            db.execute("UPDATE users SET email=?,password_hash=?,name=?,google_sub=?,college_name=?,claimable_student=0,claim_email=NULL WHERE id=?",
+                       (email, hash_secret(body.password), body.name.strip(), identity["sub"], SAHE_INSTITUTION_NAME, claimed["id"]))
+            db.execute("UPDATE students SET name=? WHERE student_id=?", (body.name.strip(), sid))
+            return make_session(db, claimed["id"])
         user_id = uid()
         db.execute("INSERT INTO users(id,email,password_hash,role,name,created_at,google_sub,college_name) VALUES (?,?,?,?,?,?,?,?)",
                    (user_id, email, hash_secret(body.password), "student",
                     body.name.strip(), now_iso(), identity["sub"], SAHE_INSTITUTION_NAME))
         db.execute("INSERT OR IGNORE INTO students(student_id,name,embedding) VALUES (?,?,?)",
                    (sid, body.name.strip(), b""))
-        section_id = f"{branch}-{body.year}-{section}"
         db.execute("INSERT OR IGNORE INTO sections(id,branch,year,section) VALUES (?,?,?,?)",
                    (section_id, branch, body.year, section))
         db.execute("INSERT INTO student_profiles(user_id,student_id,section_id,joined_at,enrollment_status) VALUES (?,?,?,?,'pending')",
@@ -855,6 +921,241 @@ def require_assignment(db: sqlite3.Connection, teacher_id: str, section_id: str,
             WHERE d.hod_user_id=?""", (teacher_id, section_id, teacher_id)).fetchone()
         if hod is None or slot_id:
             raise HTTPException(403, "You are not assigned to this class.")
+
+
+def camera_process_state(source: str, process_info: dict[str, Any]) -> dict[str, Any]:
+    process = process_info["process"]
+    return {
+        "source": source,
+        "cameraId": source,
+        "name": process_info["name"],
+        "cameraType": process_info["cameraType"],
+        "sectionId": process_info["sectionId"],
+        "eventType": process_info["eventType"],
+        "eventCode": 1 if process_info["eventType"] == "entry" else 0,
+        "running": process.poll() is None,
+    }
+
+
+def available_usb_cameras() -> list[dict[str, Any]]:
+    devices = []
+    for source in range(CAMERA_SOURCE_LIMIT):
+        capture = cv2.VideoCapture(source, cv2.CAP_ANY)
+        try:
+            if capture.isOpened():
+                devices.append({"source": f"usb-{source}", "name": f"USB camera {source}", "cameraType": "usb"})
+        finally:
+            capture.release()
+    return devices
+
+
+def configured_ip_cameras() -> list[dict[str, str]]:
+    """Read operator-managed streams without exposing source URLs to clients.
+
+    TRUE_EYE_IP_CAMERAS_JSON is a JSON list of {id, name, sectionId, url}.
+    Stream URLs and embedded credentials remain server-side.
+    """
+    raw = os.environ.get("TRUE_EYE_IP_CAMERAS_JSON", "").strip()
+    if not raw:
+        return []
+    try:
+        configured = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(503, "The operator IP camera configuration is invalid JSON.") from exc
+    if not isinstance(configured, list):
+        raise HTTPException(503, "The operator IP camera configuration must be a JSON list.")
+    result = []
+    seen: set[str] = set()
+    for item in configured:
+        if not isinstance(item, dict):
+            raise HTTPException(503, "Each operator IP camera entry must be an object.")
+        camera_id = str(item.get("id", "")).strip()
+        name = str(item.get("name", "")).strip()
+        section_id = str(item.get("sectionId", "")).strip()
+        stream_url = str(item.get("url", "")).strip()
+        if (not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", camera_id) or camera_id.startswith("usb-")
+            or camera_id in seen or not name or len(name) > 120 or not section_id
+            or not (stream_url.startswith("rtsp://") or stream_url.startswith("rtsps://")
+                    or stream_url.startswith("http://") or stream_url.startswith("https://"))):
+            raise HTTPException(503, "An operator IP camera entry has an invalid ID, name, section, or RTSP/HTTP URL.")
+        seen.add(camera_id)
+        result.append({"source": camera_id, "name": name, "cameraType": "ip", "sectionId": section_id, "url": stream_url})
+    return result
+
+
+@app.get("/api/teacher/cameras")
+def teacher_cameras(user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with _camera_process_lock:
+        for source, info in list(_camera_processes.items()):
+            if info["process"].poll() is not None:
+                _camera_processes.pop(source, None)
+        running = [
+            camera_process_state(source, info)
+            for source, info in _camera_processes.items()
+            if info["ownerId"] == user["id"]
+        ]
+    with connect() as db:
+        sections = {row["section_id"] for row in db.execute(
+            "SELECT DISTINCT section_id FROM teaching_assignments WHERE teacher_id=?", (user["id"],)
+        ).fetchall()}
+    ip_devices = [{key: value for key, value in camera.items() if key != "url"}
+                  for camera in configured_ip_cameras() if camera["sectionId"] in sections]
+    return {"devices": available_usb_cameras() + ip_devices, "running": running}
+
+
+@app.get("/api/teacher/cameras/status")
+def teacher_camera_status(user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with _camera_process_lock:
+        running = []
+        for source, info in list(_camera_processes.items()):
+            if info["process"].poll() is not None:
+                _camera_processes.pop(source, None)
+            elif info["ownerId"] == user["id"]:
+                running.append(camera_process_state(source, info))
+    return {"running": running}
+
+
+@app.post("/api/teacher/cameras/start")
+def start_teacher_camera(body: CameraStartInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with connect() as db:
+        require_assignment(db, user["id"], body.sectionId)
+
+    if body.source.startswith("usb-"):
+        try:
+            usb_index = int(body.source[4:])
+        except ValueError as exc:
+            raise HTTPException(422, "Choose a valid USB camera.") from exc
+        if not 0 <= usb_index < CAMERA_SOURCE_LIMIT:
+            raise HTTPException(422, "Choose a valid USB camera.")
+        source_value: int | str = usb_index
+        camera_id = body.source
+        camera_name = f"USB camera {usb_index}"
+        camera_type = "usb"
+    else:
+        camera = next((item for item in configured_ip_cameras() if item["source"] == body.source), None)
+        if camera is None or camera["sectionId"] != body.sectionId:
+            raise HTTPException(403, "This IP camera is not configured for your selected class.")
+        source_value = camera["url"]
+        camera_id = camera["source"]
+        camera_name = camera["name"]
+        camera_type = "ip"
+
+    with _camera_process_lock:
+        existing = _camera_processes.get(body.source)
+        if existing and existing["process"].poll() is None:
+            raise HTTPException(409, f"{camera_name} is already running a recognition session.")
+        if existing:
+            _camera_processes.pop(body.source, None)
+
+        script = ROOT / "scripts" / "core" / "liv_recog.py"
+        command = [
+            sys.executable, str(script),
+            "--section-id", body.sectionId, "--camera-id", camera_id,
+            "--event-code", str(1 if body.eventType == "entry" else 0), "--headless",
+        ]
+        if camera_type == "usb":
+            command.extend(["--source", str(source_value)])
+        preview_key = secrets.token_urlsafe(32)
+        preview_url = os.environ.get("TRUE_EYE_PREVIEW_API_URL", "http://127.0.0.1:8000").rstrip("/")
+        info = {"process": None, "ownerId": user["id"], "sectionId": body.sectionId,
+                "eventType": body.eventType, "name": camera_name, "cameraType": camera_type,
+                "previewKey": preview_key, "previewTokens": {},
+                "previewUrl": f"{preview_url}/api/internal/camera-preview/{camera_id}"}
+        environment = {**os.environ, "TRUE_EYE_CAMERA_SOURCE": str(source_value),
+                       "TRUE_EYE_PREVIEW_KEY": preview_key,
+                       "TRUE_EYE_PREVIEW_URL": info["previewUrl"]}
+        try:
+            process = subprocess.Popen(
+                command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=environment,
+            )
+            info["process"] = process
+            _camera_processes[camera_id] = info
+        except OSError as exc:
+            raise HTTPException(503, f"Could not start camera recognition: {exc}") from exc
+        return camera_process_state(camera_id, info)
+
+
+@app.post("/api/teacher/cameras/{source}/stop")
+def stop_teacher_camera(source: str, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    with _camera_process_lock:
+        info = _camera_processes.get(source)
+        if info is None:
+            raise HTTPException(404, "There is no active recognition session for that camera.")
+        if info["ownerId"] != user["id"]:
+            raise HTTPException(403, "Only the teacher who started this camera can stop it.")
+        process = info["process"]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        _camera_processes.pop(source, None)
+        return {"source": source, "running": False}
+
+
+@app.post("/api/teacher/cameras/{source}/preview-token")
+def create_camera_preview_token(source: str, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, str]:
+    with _camera_process_lock:
+        info = _camera_processes.get(source)
+        if info is None or info["process"].poll() is not None:
+            raise HTTPException(404, "Start this camera before opening its live preview.")
+        if info["ownerId"] != user["id"]:
+            raise HTTPException(403, "Only the teacher who started this camera can watch its preview.")
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(minutes=90)
+        info["previewTokens"][digest_token(token)] = expires
+        return {"token": token}
+
+
+@app.post("/api/internal/camera-preview/{camera_id}", status_code=204)
+async def receive_camera_preview(
+    camera_id: str,
+    request: Request,
+    x_preview_key: str | None = Header(default=None),
+) -> None:
+    with _camera_process_lock:
+        info = _camera_processes.get(camera_id)
+        if info is None or not x_preview_key or not hmac.compare_digest(x_preview_key, info["previewKey"]):
+            raise HTTPException(403, "Camera preview publisher is not authorized.")
+    frame = await request.body()
+    if len(frame) > 1_500_000 or not frame.startswith(b"\xff\xd8"):
+        raise HTTPException(422, "Invalid camera preview frame.")
+    with _camera_process_lock:
+        info["previewFrame"] = frame
+        info["previewUpdated"] = monotonic_time.monotonic()
+
+
+@app.get("/api/teacher/cameras/{source}/preview")
+async def stream_camera_preview(source: str, token: str) -> StreamingResponse:
+    token_hash = digest_token(token)
+    with _camera_process_lock:
+        info = _camera_processes.get(source)
+        expiry = info["previewTokens"].get(token_hash) if info else None
+        if info is None or expiry is None or expiry <= datetime.now(timezone.utc):
+            raise HTTPException(403, "Camera preview link expired. Refresh the camera preview.")
+
+    async def frames():
+        last_frame: bytes | None = None
+        while True:
+            with _camera_process_lock:
+                current = _camera_processes.get(source)
+                if current is not info or current["process"].poll() is not None:
+                    break
+                expires = current["previewTokens"].get(token_hash)
+                frame = current.get("previewFrame")
+            if expires is None or expires <= datetime.now(timezone.utc):
+                break
+            if frame is not None and frame != last_frame:
+                last_frame = frame
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            await asyncio.sleep(0.12)
+
+    return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame",
+                             headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                                      "Pragma": "no-cache", "Referrer-Policy": "no-referrer"})
 
 
 def slot_obj(row: sqlite3.Row) -> dict[str, Any]:
@@ -1278,7 +1579,7 @@ def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alia
         if slotId and not any(slot["id"] == slotId for slot in effective_section_schedule(db, sectionId, target)):
             raise HTTPException(404, "Period is not scheduled for that class and date.")
         if slotId and db.execute("SELECT 1 FROM timetable_slots WHERE id=? AND section_id=?",(slotId,sectionId)).fetchone() is None: raise HTTPException(404,"Period not found.")
-        students=db.execute("""SELECT s.student_id,s.name,p.enrollment_status FROM student_profiles p JOIN students s ON s.student_id=p.student_id
+        students=db.execute("""SELECT s.student_id,s.name,p.enrollment_status,(length(s.embedding)>0) face_enrolled FROM student_profiles p JOIN students s ON s.student_id=p.student_id
           WHERE p.section_id=? ORDER BY s.name""",(sectionId,)).fetchall()
         result=[]
         for student in students:
@@ -1287,11 +1588,11 @@ def teacher_roster(sectionId: str, date_: str = __import__("fastapi").Query(alia
             rows=db.execute(q+" ORDER BY in_time",args).fetchall()
             if not rows:
                 review=attendance_review(db,student["student_id"],target.isoformat(),slotId)
-                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None,"enrollmentStatus":student["enrollment_status"],**review})
+                result.append({"studentId":student["student_id"],"name":student["name"],"status":"unmarked","inTime":None,"method":None,"enrollmentStatus":student["enrollment_status"],"faceEnrolled":bool(student["face_enrolled"]),**review})
             else:
                 for row in rows:
                     review=attendance_review(db,student["student_id"],target.isoformat(),row["slot_id"])
-                    result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"],"enrollmentStatus":student["enrollment_status"],**review})
+                    result.append({"studentId":student["student_id"],"name":student["name"],"status":row["status"],"inTime":row["in_time"],"method":row["method"],"enrollmentStatus":student["enrollment_status"],"faceEnrolled":bool(student["face_enrolled"]),**review})
         return result
 
 
@@ -1329,6 +1630,146 @@ class StudentReviewInput(BaseModel):
     status: str = Field(pattern="^(approved|rejected)$")
 
 
+class TeacherStudentCreateInput(BaseModel):
+    sectionId: str = Field(min_length=1, max_length=64)
+    studentId: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    image: str = Field(min_length=1, max_length=3_000_000)
+
+
+class TeacherFaceEnrollmentInput(BaseModel):
+    sectionId: str = Field(min_length=1, max_length=64)
+    image: str = Field(min_length=1, max_length=3_000_000)
+
+
+def face_embedding_from_image(data_url: str) -> bytes:
+    if len(data_url) > 3_000_000:
+        raise HTTPException(413, "Image must be smaller than 2 MB.")
+    try:
+        encoded = data_url.split(",", 1)[1] if data_url.startswith("data:image/") and ";base64," in data_url else ""
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, IndexError) as exc:
+        raise HTTPException(422, "Provide a valid camera image.") from exc
+    if not raw or len(raw) > 2_000_000:
+        raise HTTPException(422, "Provide a valid image smaller than 2 MB.")
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(422, "The uploaded image could not be read.")
+    if not MODEL_DETECT.is_file() or not MODEL_RECOGNIZE.is_file():
+        raise HTTPException(503, "Face recognition models are not installed.")
+    detector = cv2.FaceDetectorYN.create(str(MODEL_DETECT), "", (320, 320), 0.8, 0.3, 5000)
+    detector.setInputSize((image.shape[1], image.shape[0]))
+    _, faces = detector.detect(image)
+    if faces is None or len(faces) != 1:
+        raise HTTPException(422, "Place exactly one face in the camera frame.")
+    recognizer = cv2.FaceRecognizerSF.create(str(MODEL_RECOGNIZE), "")
+    try:
+        face = max(faces, key=lambda item: item[2] * item[3])
+        embedding = recognizer.feature(recognizer.alignCrop(image, face)).astype(np.float32)
+    except cv2.error as exc:
+        raise HTTPException(422, "Could not create a face embedding from this frame.") from exc
+    norm = float(np.linalg.norm(embedding))
+    if norm == 0 or not np.isfinite(norm) or not np.isfinite(embedding).all():
+        raise HTTPException(422, "Could not create a valid face embedding.")
+    return (embedding / norm).astype(np.float32).tobytes()
+
+
+def save_or_verify_face_embedding(db: sqlite3.Connection, student_id: str, embedding: bytes) -> None:
+    existing = db.execute("SELECT embedding FROM students WHERE student_id=?", (student_id,)).fetchone()
+    if existing is None:
+        raise HTTPException(404, "Student attendance record was not found.")
+    if existing["embedding"]:
+        stored = np.frombuffer(existing["embedding"], dtype=np.float32)
+        captured = np.frombuffer(embedding, dtype=np.float32)
+        if stored.shape != captured.shape or not np.isfinite(stored).all():
+            raise HTTPException(409, "This student has an incompatible face record. Contact your attendance operator.")
+        if float(np.dot(stored, captured)) < 0.363:
+            raise HTTPException(409, "The captured face does not match the face already registered to this roll number.")
+        return
+    db.execute("UPDATE students SET embedding=? WHERE student_id=?", (embedding, student_id))
+    db.execute("DELETE FROM student_embeddings WHERE student_id=?", (student_id,))
+
+
+def require_face_enrollment_permission(db: sqlite3.Connection, teacher_id: str, section_id: str) -> None:
+    require_assignment(db, teacher_id, section_id)
+    member = db.execute("""SELECT m.enroll_students,d.hod_user_id FROM department_members m
+      JOIN departments d ON d.id=m.department_id JOIN teacher_profiles tp ON tp.department_id=d.id AND tp.user_id=m.user_id
+      WHERE m.user_id=?""", (teacher_id,)).fetchone()
+    if member and member["hod_user_id"] != teacher_id and not member["enroll_students"]:
+        raise HTTPException(403, "Your department lead has not granted student enrollment permission.")
+
+
+class TeacherStudentCreateInput(BaseModel):
+    sectionId: str = Field(min_length=1, max_length=64)
+    studentId: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(min_length=3, max_length=254)
+    image: str = Field(min_length=1, max_length=3_000_000)
+
+
+class TeacherFaceEnrollmentInput(BaseModel):
+    sectionId: str = Field(min_length=1, max_length=64)
+    image: str = Field(min_length=1, max_length=3_000_000)
+
+
+def face_embedding_from_image(data_url: str) -> bytes:
+    if len(data_url) > 3_000_000:
+        raise HTTPException(413, "Image must be smaller than 2 MB.")
+    try:
+        encoded = data_url.split(",", 1)[1] if data_url.startswith("data:image/") and ";base64," in data_url else ""
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, IndexError) as exc:
+        raise HTTPException(422, "Provide a valid camera image.") from exc
+    if not raw or len(raw) > 2_000_000:
+        raise HTTPException(422, "Provide a valid image smaller than 2 MB.")
+    image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(422, "The uploaded image could not be read.")
+    if not MODEL_DETECT.is_file() or not MODEL_RECOGNIZE.is_file():
+        raise HTTPException(503, "Face recognition models are not installed.")
+    detector = cv2.FaceDetectorYN.create(str(MODEL_DETECT), "", (320, 320), 0.8, 0.3, 5000)
+    detector.setInputSize((image.shape[1], image.shape[0]))
+    _, faces = detector.detect(image)
+    if faces is None or len(faces) != 1:
+        raise HTTPException(422, "Place exactly one face in the camera frame.")
+    recognizer = cv2.FaceRecognizerSF.create(str(MODEL_RECOGNIZE), "")
+    try:
+        face = max(faces, key=lambda item: item[2] * item[3])
+        embedding = recognizer.feature(recognizer.alignCrop(image, face)).astype(np.float32)
+    except cv2.error as exc:
+        raise HTTPException(422, "Could not create a face embedding from this frame.") from exc
+    norm = float(np.linalg.norm(embedding))
+    if norm == 0:
+        raise HTTPException(422, "Could not create a valid face embedding.")
+    return (embedding / norm).astype(np.float32).tobytes()
+
+
+def save_or_verify_face_embedding(db: sqlite3.Connection, student_id: str, embedding: bytes) -> None:
+    existing = db.execute("SELECT embedding FROM students WHERE student_id=?", (student_id,)).fetchone()
+    if existing is None:
+        raise HTTPException(404, "Student attendance record was not found.")
+    if existing["embedding"]:
+        stored = np.frombuffer(existing["embedding"], dtype=np.float32)
+        captured = np.frombuffer(embedding, dtype=np.float32)
+        if stored.shape != captured.shape or not np.isfinite(stored).all():
+            raise HTTPException(409, "This student has an incompatible face record. Contact your attendance operator.")
+        if float(np.dot(stored, captured)) < 0.363:
+            raise HTTPException(409, "The captured face does not match the face already registered to this roll number.")
+        return
+    db.execute("UPDATE students SET embedding=? WHERE student_id=?", (embedding, student_id))
+    db.execute("DELETE FROM student_embeddings WHERE student_id=?", (student_id,))
+
+
+def require_face_enrollment_permission(db: sqlite3.Connection, teacher_id: str, section_id: str) -> None:
+    require_assignment(db, teacher_id, section_id)
+    member = db.execute("""SELECT m.enroll_students,d.hod_user_id FROM department_members m
+      JOIN departments d ON d.id=m.department_id JOIN teacher_profiles tp ON tp.department_id=d.id
+      WHERE m.user_id=?""", (teacher_id,)).fetchone()
+    if member and member["hod_user_id"] != teacher_id and not member["enroll_students"]:
+        raise HTTPException(403, "Your department lead has not granted student enrollment permission.")
+
+
 @app.patch("/api/teacher/students/{student_id}/enrollment")
 def review_student(student_id: str, body: StudentReviewInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, str]:
     with connect() as db:
@@ -1338,6 +1779,104 @@ def review_student(student_id: str, body: StudentReviewInput, user: sqlite3.Row 
         if cursor.rowcount == 0:
             raise HTTPException(404, "Student class request was not found.")
         return {"studentId": student_id, "enrollmentStatus": body.status}
+
+
+@app.post("/api/teacher/students")
+def teacher_create_student(body: TeacherStudentCreateInput,
+                           user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    claim_email = verified_email_address(body.email)
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        if db.execute("SELECT 1 FROM sections WHERE id=?", (body.sectionId,)).fetchone() is None:
+            raise HTTPException(404, "Class section was not found.")
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE OR claim_email=? COLLATE NOCASE", (claim_email, claim_email)).fetchone():
+            raise HTTPException(409, "An account already uses that email address.")
+        if db.execute("SELECT 1 FROM students WHERE student_id=?", (body.studentId.strip(),)).fetchone():
+            raise HTTPException(409, "That roll number already exists. Open the class roster to capture or verify its face.")
+    embedding = face_embedding_from_image(body.image)
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE OR claim_email=? COLLATE NOCASE", (claim_email, claim_email)).fetchone():
+            raise HTTPException(409, "An account already uses that email address.")
+        if db.execute("SELECT 1 FROM students WHERE student_id=?", (body.studentId.strip(),)).fetchone():
+            raise HTTPException(409, "That roll number already exists. Open the class roster to capture or verify its face.")
+        user_id = uid()
+        placeholder_email = f"claim-{uid()}@pending.trueeye.invalid"
+        db.execute("""INSERT INTO users(id,email,password_hash,role,name,created_at,college_name,claimable_student,claim_email)
+          VALUES (?,?,?,'student',?,?,?,1,?)""",
+                   (user_id, placeholder_email, hash_secret(secrets.token_urlsafe(32)), body.name.strip(),
+                    now_iso(), SAHE_INSTITUTION_NAME, claim_email))
+        db.execute("INSERT INTO students(student_id,name,embedding) VALUES (?,?,?)",
+                   (body.studentId.strip(), body.name.strip(), embedding))
+        db.execute("""INSERT INTO student_profiles(user_id,student_id,section_id,joined_at,enrollment_status)
+          VALUES (?,?,?,?,'approved')""",
+                   (user_id, body.studentId.strip(), body.sectionId, now_iso()))
+        return {"studentId": body.studentId.strip(), "name": body.name.strip(),
+                "sectionId": body.sectionId, "faceEnrolled": True, "accountStatus": "awaiting_student_claim"}
+
+
+@app.post("/api/teacher/students/{student_id}/face")
+def teacher_enroll_face(student_id: str, body: TeacherFaceEnrollmentInput,
+                        user: sqlite3.Row = Depends(require_teacher)) -> dict[str, bool]:
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        student = db.execute("SELECT 1 FROM student_profiles WHERE student_id=? AND section_id=?",
+                             (student_id, body.sectionId)).fetchone()
+        if student is None:
+            raise HTTPException(404, "Student is not on this class roster.")
+    embedding = face_embedding_from_image(body.image)
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        student = db.execute("SELECT 1 FROM student_profiles WHERE student_id=? AND section_id=?",
+                             (student_id, body.sectionId)).fetchone()
+        if student is None:
+            raise HTTPException(404, "Student is not on this class roster.")
+        save_or_verify_face_embedding(db, student_id, embedding)
+        return {"faceEnrolled": True}
+
+
+@app.post("/api/teacher/students")
+def teacher_create_student(body: TeacherStudentCreateInput,
+                           user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
+    claim_email = verified_email_address(body.email)
+    embedding = face_embedding_from_image(body.image)
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        if db.execute("SELECT 1 FROM sections WHERE id=?", (body.sectionId,)).fetchone() is None:
+            raise HTTPException(404, "Class section was not found.")
+        if db.execute("SELECT 1 FROM users WHERE email=? COLLATE NOCASE", (claim_email,)).fetchone():
+            raise HTTPException(409, "An account already uses that email address.")
+        if db.execute("SELECT 1 FROM students WHERE student_id=?", (body.studentId.strip(),)).fetchone():
+            raise HTTPException(409, "That roll number already exists. Open the class roster to capture or verify its face.")
+        user_id = uid()
+        # This private placeholder cannot sign in. The student claims it later
+        # through the existing verified signup flow using the entered email.
+        placeholder_email = f"claim-{uid()}@pending.trueeye.invalid"
+        db.execute("""INSERT INTO users(id,email,password_hash,role,name,created_at,college_name,claimable_student,claim_email)
+          VALUES (?,?,?,'student',?,?,?,1,?)""",
+                   (user_id, placeholder_email, hash_secret(secrets.token_urlsafe(32)), body.name.strip(),
+                    now_iso(), SAHE_INSTITUTION_NAME, claim_email))
+        db.execute("INSERT INTO students(student_id,name,embedding) VALUES (?,?,?)",
+                   (body.studentId.strip(), body.name.strip(), embedding))
+        db.execute("""INSERT INTO student_profiles(user_id,student_id,section_id,joined_at,enrollment_status)
+          VALUES (?,?,?,?,'approved')""",
+                   (user_id, body.studentId.strip(), body.sectionId, now_iso()))
+        return {"studentId": body.studentId.strip(), "name": body.name.strip(),
+                "sectionId": body.sectionId, "faceEnrolled": True, "accountStatus": "awaiting_student_claim"}
+
+
+@app.post("/api/teacher/students/{student_id}/face")
+def teacher_enroll_face(student_id: str, body: TeacherFaceEnrollmentInput,
+                        user: sqlite3.Row = Depends(require_teacher)) -> dict[str, bool]:
+    embedding = face_embedding_from_image(body.image)
+    with connect() as db:
+        require_face_enrollment_permission(db, user["id"], body.sectionId)
+        student = db.execute("SELECT 1 FROM student_profiles WHERE student_id=? AND section_id=?",
+                             (student_id, body.sectionId)).fetchone()
+        if student is None:
+            raise HTTPException(404, "Student is not on this class roster.")
+        save_or_verify_face_embedding(db, student_id, embedding)
+        return {"faceEnrolled": True}
 
 
 @app.patch("/api/teacher/attendance")
@@ -1552,8 +2091,11 @@ def validate_timetable(db: sqlite3.Connection, body: TimetableInput, user: sqlit
 @app.post("/api/teacher/timetable/preview")
 def preview_timetable(body: TimetableInput, user: sqlite3.Row = Depends(require_teacher)) -> dict[str, Any]:
     with connect() as db:
-        _,errors,imported,replaced=validate_timetable(db,body,user)
-        return {"imported":imported,"replaced":replaced,"errors":errors}
+        valid,errors,imported,replaced=validate_timetable(db,body,user)
+        preview = [{"id": str(row["line"]), "dayOfWeek": row["day"], "startTime": row["start"],
+                    "endTime": row["end"], "subjectId": row["code"], "subjectName": row["name"],
+                    "room": row["room"]} for row in valid]
+        return {"imported":imported,"replaced":replaced,"errors":errors,"preview":preview}
 
 
 @app.post("/api/teacher/timetable/upload")
@@ -1768,40 +2310,10 @@ def department_analytics(user: sqlite3.Row=Depends(require_teacher)) -> list[dic
 @app.post("/api/student/enrollment")
 def enroll_face(body: dict[str,str],user: sqlite3.Row=Depends(get_user)) -> dict[str,int]:
     if user["role"]!="student": raise HTTPException(403,"Student access is required.")
-    data_url=body.get("image","")
-    if len(data_url)>3_000_000: raise HTTPException(413,"Image must be smaller than 2 MB.")
-    try:
-        encoded=data_url.split(",",1)[1] if data_url.startswith("data:image/") and ";base64," in data_url else ""
-        raw=base64.b64decode(encoded,validate=True)
-    except (ValueError,IndexError) as exc: raise HTTPException(422,"Provide a valid camera image.") from exc
-    if not raw or len(raw)>2_000_000: raise HTTPException(422,"Provide a valid image smaller than 2 MB.")
-    image=cv2.imdecode(np.frombuffer(raw,dtype=np.uint8),cv2.IMREAD_COLOR)
-    if image is None: raise HTTPException(422,"The uploaded image could not be read.")
-    if not MODEL_DETECT.is_file() or not MODEL_RECOGNIZE.is_file(): raise HTTPException(503,"Face recognition models are not installed.")
-    detector=cv2.FaceDetectorYN.create(str(MODEL_DETECT),"",(320,320),0.8,0.3,5000)
-    detector.setInputSize((image.shape[1],image.shape[0]))
-    _,faces=detector.detect(image)
-    if faces is None or len(faces)!=1: raise HTTPException(422,"Place exactly one face in the camera frame.")
-    recognizer=cv2.FaceRecognizerSF.create(str(MODEL_RECOGNIZE),"")
-    try: embedding=recognizer.feature(recognizer.alignCrop(image,max(faces,key=lambda f:f[2]*f[3]))).astype(np.float32)
-    except cv2.error as exc: raise HTTPException(422,"Could not create a face embedding from this frame.") from exc
-    norm=float(np.linalg.norm(embedding))
-    if norm==0: raise HTTPException(422,"Could not create a valid face embedding.")
-    embedding=(embedding/norm).astype(np.float32).tobytes()
+    embedding=face_embedding_from_image(body.get("image", ""))
     with connect() as db:
         profile=student_profile(db,user)
-        existing=db.execute("SELECT embedding FROM students WHERE student_id=?",(profile["studentId"],)).fetchone()
-        if existing is None: raise HTTPException(404,"No attendance identity is registered for this account.")
-        if existing["embedding"]:
-            stored=np.frombuffer(existing["embedding"],dtype=np.float32)
-            captured=np.frombuffer(embedding,dtype=np.float32)
-            if stored.shape != captured.shape or not np.isfinite(stored).all():
-                raise HTTPException(409,"That roll number already has an incompatible face record. Contact your attendance operator.")
-            if float(np.dot(stored,captured)) < 0.363:
-                raise HTTPException(409,"The captured face does not match the face already registered to that roll number.")
-            return {"harvestedReferences":0}
-        db.execute("UPDATE students SET embedding=? WHERE student_id=?",(embedding,profile["studentId"]))
-        db.execute("DELETE FROM student_embeddings WHERE student_id=?",(profile["studentId"],))
+        save_or_verify_face_embedding(db, profile["studentId"], embedding)
         return {"harvestedReferences":0}
 
 

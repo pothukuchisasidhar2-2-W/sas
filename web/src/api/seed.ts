@@ -32,6 +32,8 @@ export interface MockUser {
   email: string;
   password: string;
   role: Role;
+  claimableStudent?: boolean;
+  claimEmail?: string;
 }
 
 /**

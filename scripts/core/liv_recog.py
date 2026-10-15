@@ -6,6 +6,8 @@ import argparse
 import os
 import sys
 import time as monotonic_time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -60,6 +62,12 @@ def options() -> argparse.Namespace:
         help="Whether the camera watches the classroom entrance or exit.",
     )
     parser.add_argument(
+        "--event-code",
+        choices=(0, 1),
+        type=int,
+        help="Numeric direction code: 1 for entry, 0 for exit. Overrides --event-type.",
+    )
+    parser.add_argument(
         "--db-path",
         default=os.environ.get("TRUE_EYE_DB", str(PROJECT_ROOT / "attendance.db")),
         help="Shared SQLite database path (default: TRUE_EYE_DB or attendance.db).",
@@ -89,6 +97,8 @@ def options() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true",
                         help="Disable the preview window for a service or headless host.")
     args = parser.parse_args()
+    if args.event_code is not None:
+        args.event_type = "entry" if args.event_code == 1 else "exit"
     if not args.section_id.strip():
         parser.error("set --section-id or TRUE_EYE_CAMERA_SECTION")
     if not args.camera_id.strip():
@@ -185,6 +195,7 @@ def run() -> None:
     next_schedule_check = 0.0
     slot_cache: dict | None = None
     last_capture_failure = 0.0
+    last_preview_at = 0.0
     harvest = ref_store.HarvestState()
     try:
         while True:
@@ -232,12 +243,21 @@ def run() -> None:
                         vector = recognizer.feature(aligned)
                         score, student_id, name = ref_store.best_match(registered_students, vector)
                         recognized = score >= args.match_threshold and student_id is not None
-                        color = (0, 255, 0) if recognized else (0, 0, 255)
+                        # Exit camera labels the live detection as Absent for the
+                        # operator. This is a visual cue only: exit events remain
+                        # recorded as exits and do not rewrite attendance status.
+                        color = ((0, 0, 255) if args.event_type == "exit" else (0, 255, 0)) if recognized else (0, 0, 255)
                         label = f"{name} ({student_id})" if recognized else "Unknown"
                         cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                         cv2.putText(frame, label, (x, max(y - 10, 25)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
-                        cv2.putText(frame, f"Score: {score:.3f}", (x, y + h + 22),
+                        if recognized and args.event_type == "exit":
+                            cv2.putText(frame, "Absent", (x, y + h + 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+                            score_y = y + h + 44
+                        else:
+                            score_y = y + h + 22
+                        cv2.putText(frame, f"Score: {score:.3f}", (x, score_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         if not recognized:
                             continue
@@ -292,6 +312,24 @@ def run() -> None:
                     if now_monotonic - last_hit[student_id] > args.confirm_window:
                         last_hit.pop(student_id, None)
                         candidate_hits.pop(student_id, None)
+
+            preview_url = os.environ.get("TRUE_EYE_PREVIEW_URL", "").strip()
+            preview_key = os.environ.get("TRUE_EYE_PREVIEW_KEY", "").strip()
+            if preview_url and preview_key and now_monotonic - last_preview_at >= 0.25:
+                encoded_ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if encoded_ok:
+                    request = urllib.request.Request(
+                        preview_url,
+                        data=encoded.tobytes(),
+                        headers={"Content-Type": "image/jpeg", "X-Preview-Key": preview_key},
+                        method="POST",
+                    )
+                    try:
+                        with urllib.request.urlopen(request, timeout=0.35):
+                            pass
+                    except (urllib.error.URLError, TimeoutError):
+                        pass
+                last_preview_at = now_monotonic
 
             if not args.headless:
                 cv2.imshow("True Eye - Timetable Camera", frame)

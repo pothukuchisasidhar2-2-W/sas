@@ -15,9 +15,11 @@ import StudentEnroll from "./pages/student/StudentEnroll";
 import StudentProfile from "./pages/student/StudentProfile";
 import StudentTimetable from "./pages/student/StudentTimetable";
 import TeacherClasses from "./pages/teacher/TeacherClasses";
+import TeacherCameras from "./pages/teacher/TeacherCameras";
 import TeacherDashboard from "./pages/teacher/TeacherDashboard";
 import TeacherDepartment from "./pages/teacher/TeacherDepartment";
 import TeacherTimetable from "./pages/teacher/TeacherTimetable";
+import TeacherStudents from "./pages/teacher/TeacherStudents";
 import type { ReactNode } from "react";
 
 /** Full-page splash while the stored token is validated. */
@@ -113,6 +115,8 @@ export default function App() {
       >
         <Route index element={<TeacherDashboard />} />
         <Route path="classes" element={<TeacherClasses />} />
+        <Route path="students" element={<TeacherStudents />} />
+        <Route path="cameras" element={<TeacherCameras />} />
         <Route path="timetable" element={<TeacherTimetable />} />
         <Route path="department" element={<TeacherDepartment />} />
       </Route>

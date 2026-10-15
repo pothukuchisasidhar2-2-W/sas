@@ -103,7 +103,16 @@ records confirmed entry/exit events through shared API/database helpers. It
 checks the effective timetable and records camera heartbeats. Missing
 observations and early exits are flagged for a teacher to review; camera
 non-detection by itself is not an absence. It accepts a camera index, stream
-URL, or video path and requires a section ID.
+URL, or video path and requires a section ID. The API camera routes expose
+USB devices and operator-configured IP streams while checking teacher section
+assignments. The recognition worker publishes transient annotated JPEG frames
+to an owner-scoped API preview stream; it does not persist video. Keep IP
+stream URLs in the API host's `TRUE_EYE_IP_CAMERAS_JSON` environment, never in
+browser responses; see README for the configuration shape.
+The teacher camera page can run one distinct entry camera and one distinct exit
+camera for a section at the same time and shows both live previews. A missing
+recognition remains unobserved for teacher review; only the attendance roster
+workflow can apply a confirmed manual absent mark.
 
 `scripts/core/ref_store.py` contains the pure matching/SQLite helper logic.
 Harvested references are additional to the canonical `students.embedding`:

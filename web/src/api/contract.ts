@@ -54,6 +54,14 @@ export interface SignupStudentInput {
   studentId: string;
 }
 
+export interface TeacherCreateStudentInput {
+  sectionId: string;
+  studentId: string;
+  name: string;
+  email: string;
+  image: string;
+}
+
 export interface SignupTeacherInput {
   name: string;
   email: string;
@@ -108,6 +116,15 @@ export interface TimetableUploadResult {
   imported: number;
   replaced: number;
   errors: string[];
+  preview?: Array<{
+    id: string;
+    dayOfWeek: number;
+    startTime: string;
+    endTime: string;
+    subjectId: string;
+    subjectName: string;
+    room: string;
+  }>;
 }
 
 export interface DeptAnalytics {
@@ -162,6 +179,10 @@ export interface Api {
     token: string,
     params: { sectionId: string; date: string; slotId?: string },
   ): Promise<ClassAttendanceRow[]>;
+  /** POST /api/teacher/students - create a student account placeholder, class roster entry, and face embedding. */
+  teacherCreateStudent(token: string, input: TeacherCreateStudentInput): Promise<{ studentId: string; name: string; accountStatus: string }>;
+  /** POST /api/teacher/students/:studentId/face - enroll or verify a roster student's face. */
+  teacherEnrollFace(token: string, studentId: string, sectionId: string, image: string): Promise<{ faceEnrolled: boolean }>;
   /** PATCH /api/teacher/students/:studentId/enrollment */
   reviewStudent(token: string, studentId: string, sectionId: string, status: "approved" | "rejected"): Promise<void>;
   /** PATCH /api/teacher/attendance */

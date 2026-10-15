@@ -8,6 +8,8 @@ import { useAuth } from "../lib/auth";
 const NAV: NavItem[] = [
   { to: "/teacher", label: "Overview", end: true },
   { to: "/teacher/classes", label: "Classes" },
+  { to: "/teacher/students", label: "Students" },
+  { to: "/teacher/cameras", label: "Cameras" },
   { to: "/teacher/timetable", label: "Timetable" },
   { to: "/teacher/department", label: "Department" },
 ];
